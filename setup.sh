@@ -33,7 +33,7 @@ done
 # Version pins
 # -------------------------------------------------------------------
 TORCH_VERSION="2.11.0"
-TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+TORCH_INDEX="https://mirrors.nju.edu.cn/pytorch/whl/cu128"
 VLLM_VERSION="0.21.0"
 
 AIOHTTP_VERSION="3.9.0"
@@ -112,7 +112,7 @@ echo "[setup] Installing torch==$TORCH_VERSION from cu128 index..."
 pip install \
     "torch==$TORCH_VERSION" \
     --index-url "$TORCH_INDEX" \
-    --extra-index-url "https://pypi.org/simple"
+    # --extra-index-url "https://pypi.org/simple"
 
 echo "[setup] Verifying PyTorch CUDA support..."
 python -c "
