@@ -68,30 +68,6 @@ if ! echo "$PY_VER" | grep -q "3\.11"; then
 fi
 
 # -------------------------------------------------------------------
-# CUDA / Driver check
-# -------------------------------------------------------------------
-echo ""
-echo "[setup] Checking NVIDIA driver and CUDA..."
-if command -v nvidia-smi &>/dev/null; then
-    DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
-    CUDA_VER=$(nvidia-smi 2>/dev/null | grep "CUDA Version" | sed 's/.*CUDA Version: //' | cut -d' ' -f1)
-    echo "[setup]   Driver: $DRIVER_VER"
-    echo "[setup]   CUDA:   $CUDA_VER"
-
-    if [[ -n "$CUDA_VER" ]]; then
-        CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
-        CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
-        if [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -le 8 ]]; then
-            echo "[setup]   OK: CUDA $CUDA_VER <= 12.8"
-        elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -gt 8 ]]; then
-            echo "[setup]   WARNING: CUDA $CUDA_VER > 12.8 — Driver 570 may not support this"
-        fi
-    fi
-else
-    echo "[setup]   WARNING: nvidia-smi not found. GPU benchmarks will fail."
-fi
-
-# -------------------------------------------------------------------
 # Virtual environment
 # -------------------------------------------------------------------
 if $FRESH && [ -d ".venv" ]; then
