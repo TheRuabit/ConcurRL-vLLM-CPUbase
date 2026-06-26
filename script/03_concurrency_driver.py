@@ -1,16 +1,30 @@
+#!/usr/bin/env python3
 """
-03_concurrency_driver.py - High-Concurrency Async Profiler Client
+High-Concurrency Async Profiler Client
+=======================================
+Issues burst requests concurrently via aiohttp while capturing 5 latency
+metrics per request. Sequentially steps through concurrency tiers
+[32, 128, 256, 512, 1024], dumping raw performance arrays to JSON.
 
-Issues burst requests concurrently via aiohttp while capturing 5 latency metrics:
-  1. Client Serialization Time
-  2. Server HTTP/Scheduler Overhead
-  3. GPU Prefill Time (TTFT)
-  4. GPU Decode Time
-  5. Response Parsing Time
+Metric Hook Mapping:
+  t_serialize        — client JSON serialization time
+  t_http_overhead    — POST → first SSE byte (server scheduling + queue wait)
+  t_server_prefill   — POST → first content token (TTFT from client perspective)
+  t_decode           — first → last content token interval
+  t_response_parse   — SSE chunk parsing time
 
-Sequentially sweeps through concurrency levels [32, 128, 256, 512, 1024].
-Uses realistic 32k token context to simulate RL workload conditions.
-Outputs raw performance arrays to ./result/03_concurrency_driver.json
+Default: input 32k tokens → output 64 tokens
+
+Prerequisites:
+  vLLM server running (use 02_launch_vllm.py or manual launch)
+
+Usage:
+    python script/03_concurrency_driver.py --url http://localhost:8000
+    python script/03_concurrency_driver.py --scenarios 32 128 256
+    python script/03_concurrency_driver.py --num-batches 5 --warmup-batches 2
+
+Output:
+    result/03_concurrency_driver.json
 """
 
 import argparse
@@ -19,16 +33,55 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Parse CLI
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    description="High-concurrency async profiler — sweeps 32 to 1024"
+)
+parser.add_argument("--url", default="http://localhost:8000",
+                    help="vLLM server URL")
+parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B",
+                    help="Model name for API requests")
+parser.add_argument("--output", default=None,
+                    help="Output JSON path")
+parser.add_argument("--input-tokens", type=int, default=32000,
+                    help="Simulated input token count")
+parser.add_argument("--output-tokens", type=int, default=64,
+                    help="Max output tokens per request")
+parser.add_argument("--scenarios", nargs="+", type=int,
+                    default=[32, 128, 256, 512, 1024],
+                    help="Concurrency levels to test")
+parser.add_argument("--num-batches", type=int, default=3,
+                    help="Number of measurement batches per concurrency level")
+parser.add_argument("--warmup-batches", type=int, default=1,
+                    help="Warmup batches before measurement")
+parser.add_argument("--request-timeout", type=int, default=600,
+                    help="Per-request timeout in seconds")
+args = parser.parse_args()
+
+if args.output:
+    out_path = Path(args.output)
+else:
+    out_path = Path(__file__).resolve().parents[1] / "result" / "03_concurrency_driver.json"
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Imports (after CLI so --help is fast)
+# ---------------------------------------------------------------------------
 import aiohttp
 
-CONCURRENCY_TIERS = [32, 128, 256, 512, 1024]
-
-# Context text generator with caching
+# ---------------------------------------------------------------------------
+# Context text generator (matching reference pattern)
+# ---------------------------------------------------------------------------
 _CONTEXT_CACHE: dict[int, str] = {}
 
 def get_context_text(target_tokens: int) -> str:
-    """Generate realistic context text of approximately target_tokens length."""
     if target_tokens in _CONTEXT_CACHE:
         return _CONTEXT_CACHE[target_tokens]
     seed = (
@@ -46,173 +99,310 @@ def get_context_text(target_tokens: int) -> str:
     return text
 
 
-DEFAULT_CONTEXT_TOKENS = 32000
-DEFAULT_PROMPT = get_context_text(DEFAULT_CONTEXT_TOKENS)
-
-
-async def single_request(
-    session: aiohttp.ClientSession,
-    url: str,
-    payload: dict,
-    request_id: int,
-) -> dict:
-    record = {"request_id": request_id}
-
-    t0 = time.perf_counter()
-    body = json.dumps(payload, ensure_ascii=False)
-    record["client_serialization_ms"] = (time.perf_counter() - t0) * 1000
-
-    t1 = time.perf_counter()
-    first_token_time = None
-    token_times = []
-
-    async with session.post(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        timeout=aiohttp.ClientTimeout(total=600),
-    ) as resp:
-        t_header = time.perf_counter()
-        record["server_overhead_ms"] = (t_header - t1) * 1000
-
-        if resp.status != 200:
-            err = await resp.text()
-            record["error"] = f"HTTP {resp.status}: {err[:300]}"
-            record["total_ms"] = (time.perf_counter() - t1) * 1000
-            return record
-
-        full_text = ""
-        async for line in resp.content:
-            decoded = line.decode("utf-8", errors="ignore").strip()
-            if not decoded or not decoded.startswith("data: "):
-                continue
-            data_str = decoded[len("data: "):]
-            if data_str == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data_str)
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                token = delta.get("content", "")
-                if token:
-                    t_token = time.perf_counter()
-                    if first_token_time is None:
-                        first_token_time = t_token
-                    token_times.append(t_token)
-                    full_text += token
-            except json.JSONDecodeError:
-                continue
-
-    t_done = time.perf_counter()
-
-    if first_token_time is not None:
-        record["gpu_prefill_ms"] = (first_token_time - t1) * 1000
-    else:
-        record["gpu_prefill_ms"] = None
-
-    if len(token_times) >= 2:
-        intervals = [
-            (token_times[i + 1] - token_times[i]) * 1000
-            for i in range(len(token_times) - 1)
-        ]
-        record["gpu_decode_ms"] = sum(intervals) / len(intervals)
-    else:
-        record["gpu_decode_ms"] = None
-
-    record["response_parsing_ms"] = (t_done - t_header) * 1000
-    record["total_ms"] = (t_done - t1) * 1000
-    record["n_tokens"] = len(token_times)
-
-    return record
-
-
-async def run_tier(
-    base_url: str,
-    concurrency: int,
-    context_tokens: int,
-    max_tokens: int,
-    n_samples: int,
-) -> list[dict]:
-    url = f"{base_url}/v1/chat/completions"
-    context_text = get_context_text(context_tokens)
-    payload = {
-        "model": "default",
+def build_payload(context_text: str, model: str, max_tokens: int) -> dict:
+    return {
+        "model": model,
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": context_text},
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.7,
+        "temperature": 0.0,
         "stream": True,
     }
 
-    all_results = []
-    connector = aiohttp.TCPConnector(limit=concurrency + 64)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for batch_idx in range(n_samples):
-            tasks = [
-                single_request(session, url, payload, i)
-                for i in range(concurrency)
-            ]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in batch_results:
-                if isinstance(r, dict):
-                    all_results.append(r)
-                else:
-                    all_results.append({"error": str(r)})
-            print(f"    Batch {batch_idx+1}/{n_samples} done ({concurrency} reqs)")
-    return all_results
 
-
-async def main():
-    parser = argparse.ArgumentParser(description="ConcurRL Concurrency Driver")
-    parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
-                        help="Target context length in tokens (default: 32000)")
-    parser.add_argument("--max-tokens", type=int, default=128,
-                        help="Max output tokens per request")
-    parser.add_argument("--samples", type=int, default=3, help="Batches per tier")
-    parser.add_argument("--tiers", nargs="+", type=int, default=CONCURRENCY_TIERS)
-    parser.add_argument("--output", default="./result/03_concurrency_driver.json")
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("  ConcurRL Concurrency Driver")
-    print("=" * 60)
-    print(f"  Base URL:       {args.base_url}")
-    print(f"  Context Tokens: {args.context_tokens:,}")
-    print(f"  Max Output:     {args.max_tokens}")
-    print(f"  Tiers:          {args.tiers}")
-    print(f"  Samples:        {args.samples} batches per tier")
-    print(f"  Output:         {args.output}")
-    print("=" * 60)
-
-    all_data = {
-        "metadata": {
-            "tiers": args.tiers,
-            "samples": args.samples,
-            "context_tokens": args.context_tokens,
-            "max_tokens": args.max_tokens,
-        },
-        "results": {},
+# ---------------------------------------------------------------------------
+# Statistics helper
+# ---------------------------------------------------------------------------
+def compute_stats(values: list[float], ndigits: int = 20) -> dict:
+    if not values:
+        return {"mean": 0, "p50": 0, "p95": 0, "p99": 0, "min": 0, "max": 0}
+    n = len(values)
+    s = sorted(values)
+    return {
+        "mean": round(sum(values) / n, ndigits),
+        "p50": round(s[n // 2], ndigits),
+        "p95": round(s[int(n * 0.95)], ndigits),
+        "p99": round(s[min(int(n * 0.99), n - 1)], ndigits),
+        "min": round(s[0], ndigits),
+        "max": round(s[-1], ndigits),
     }
 
-    for tier in args.tiers:
-        print(f"\n[*] Running tier: {tier} concurrent requests (ctx={args.context_tokens:,})...")
-        t0 = time.time()
-        results = await run_tier(
-            args.base_url, tier, args.context_tokens, args.max_tokens, args.samples
+
+# ---------------------------------------------------------------------------
+# Single request profiler
+# ---------------------------------------------------------------------------
+@dataclass
+class RequestTrace:
+    concurrency_level: int = 0
+    batch: int = 0
+    idx: int = 0
+    input_tokens: int = 0
+    t_serialize_ms: float = 0.0
+    t_http_overhead_ms: float = 0.0
+    t_server_prefill_ms: float = 0.0
+    t_decode_ms: float = 0.0
+    t_response_parse_ms: float = 0.0
+    t_e2e_ms: float = 0.0
+    num_output_tokens: int = 0
+    success: bool = True
+    error: str = ""
+
+
+async def trace_one_request(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: dict,
+    concurrency_level: int,
+    batch: int,
+    idx: int,
+    input_tokens: int,
+    semaphore: asyncio.Semaphore,
+    timeout: int,
+) -> RequestTrace:
+    t = RequestTrace(
+        concurrency_level=concurrency_level,
+        batch=batch,
+        idx=idx,
+        input_tokens=input_tokens,
+    )
+    e2e_start = time.perf_counter()
+
+    t0 = time.perf_counter()
+    body = json.dumps(payload, ensure_ascii=False)
+    t.t_serialize_ms = (time.perf_counter() - t0) * 1000
+
+    t_post = time.perf_counter()
+
+    async with semaphore:
+        try:
+            async with session.post(
+                f"{url}/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                t_first_byte = time.perf_counter()
+                t.t_http_overhead_ms = (t_first_byte - t_post) * 1000
+
+                if resp.status != 200:
+                    err = await resp.text()
+                    t.success = False
+                    t.error = f"HTTP {resp.status}: {err[:300]}"
+                    t.t_e2e_ms = (time.perf_counter() - e2e_start) * 1000
+                    return t
+
+                first_token = False
+                t_first_token = None
+                t_last_token = None
+                parse_start = None
+                token_count = 0
+
+                async for line in resp.content:
+                    if parse_start is None:
+                        parse_start = time.perf_counter()
+
+                    line_str = line.decode("utf-8").strip()
+                    if line_str.startswith("data: ") and line_str != "data: [DONE]":
+                        try:
+                            chunk = json.loads(line_str[6:])
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                content = choices[0].get("delta", {}).get("content", "")
+                                if content:
+                                    if not first_token:
+                                        t_first_token = time.perf_counter()
+                                        t.t_server_prefill_ms = (t_first_token - t_post) * 1000
+                                        first_token = True
+                                    t_last_token = time.perf_counter()
+                                    token_count += 1
+                        except json.JSONDecodeError:
+                            pass
+
+                if parse_start:
+                    t.t_response_parse_ms = (time.perf_counter() - parse_start) * 1000
+                if first_token and t_last_token:
+                    t.t_decode_ms = (t_last_token - t_first_token) * 1000
+                t.num_output_tokens = token_count
+
+        except asyncio.TimeoutError:
+            t.success = False
+            t.error = "Timeout"
+        except Exception as e:
+            t.success = False
+            t.error = str(e)[:300]
+
+    t.t_e2e_ms = (time.perf_counter() - e2e_start) * 1000
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Batch runner
+# ---------------------------------------------------------------------------
+async def run_batch(
+    session: aiohttp.ClientSession,
+    url: str,
+    model: str,
+    concurrency_level: int,
+    batch: int,
+    input_tokens: int,
+    output_tokens: int,
+    timeout: int,
+) -> list[RequestTrace]:
+    text = get_context_text(input_tokens)
+    sem = asyncio.Semaphore(concurrency_level)
+    tasks = [
+        trace_one_request(
+            session, url,
+            build_payload(text, model, output_tokens),
+            concurrency_level, batch, i, input_tokens, sem, timeout,
         )
-        elapsed = time.time() - t0
-        all_data["results"][str(tier)] = results
-        valid = [r for r in results if "error" not in r]
-        print(f"    Completed: {len(valid)}/{len(results)} successful in {elapsed:.1f}s")
+        for i in range(concurrency_level)
+    ]
+    print(f"    Batch {batch}: {concurrency_level} req, "
+          f"input={input_tokens:,}...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    results = await asyncio.gather(*tasks)
+    elapsed = time.perf_counter() - t0
+    ok = sum(1 for r in results if r.success)
+    print(f"{elapsed:.1f}s, {ok}/{len(results)} OK")
+    return results
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(all_data, f, indent=2)
 
-    print(f"\n[+] Results written to {args.output}")
-    print("[*] Done.")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+async def main():
+    url = args.url.rstrip("/")
+    print(f"[03_driver] Concurrency sweep — async profiler")
+    print(f"[03_driver] Server:       {url}")
+    print(f"[03_driver] Model:        {args.model}")
+    print(f"[03_driver] Input tokens: {args.input_tokens:,}")
+    print(f"[03_driver] Output tokens: {args.output_tokens}")
+    print(f"[03_driver] Scenarios:    {args.scenarios}")
+    print(f"[03_driver] Batches:      {args.num_batches} (+{args.warmup_batches} warmup)")
+    print()
+
+    all_traces: list[RequestTrace] = []
+    scenario_summaries: dict[str, dict] = {}
+
+    async with aiohttp.ClientSession() as session:
+        for concurrency in args.scenarios:
+            print(f"{'─'*60}")
+            print(f"  Concurrency Level: {concurrency}")
+            print(f"{'─'*60}")
+
+            # Warmup
+            for w in range(args.warmup_batches):
+                await run_batch(
+                    session, url, args.model,
+                    concurrency, -1,  # warmup batch marker
+                    args.input_tokens, args.output_tokens,
+                    args.request_timeout,
+                )
+
+            # Measurement
+            scenario_traces: list[RequestTrace] = []
+            for b in range(args.num_batches):
+                batch_results = await run_batch(
+                    session, url, args.model,
+                    concurrency, b,
+                    args.input_tokens, args.output_tokens,
+                    args.request_timeout,
+                )
+                scenario_traces.extend(batch_results)
+
+            all_traces.extend(scenario_traces)
+
+            # Per-scenario summary
+            successful = [r for r in scenario_traces if r.success]
+            if successful:
+                summary = {
+                    "concurrency": concurrency,
+                    "num_requests": len(scenario_traces),
+                    "num_successful": len(successful),
+                    "t_serialize_ms": compute_stats([r.t_serialize_ms for r in successful]),
+                    "t_http_overhead_ms": compute_stats([r.t_http_overhead_ms for r in successful]),
+                    "t_server_prefill_ms": compute_stats([r.t_server_prefill_ms for r in successful]),
+                    "t_decode_ms": compute_stats([r.t_decode_ms for r in successful]),
+                    "t_response_parse_ms": compute_stats([r.t_response_parse_ms for r in successful]),
+                    "t_e2e_ms": compute_stats([r.t_e2e_ms for r in successful]),
+                }
+            else:
+                summary = {
+                    "concurrency": concurrency,
+                    "num_requests": len(scenario_traces),
+                    "num_successful": 0,
+                    "error": "All requests failed",
+                }
+            scenario_summaries[str(concurrency)] = summary
+
+            print(f"  → P95 E2E: {summary.get('t_e2e_ms', {}).get('p95', 'N/A')}ms\n")
+
+    # -------------------------------------------------------------------
+    # Save
+    # -------------------------------------------------------------------
+    raw_traces = []
+    for t in all_traces:
+        raw_traces.append({
+            "concurrency_level": t.concurrency_level,
+            "batch": t.batch,
+            "idx": t.idx,
+            "input_tokens": t.input_tokens,
+            "t_serialize_ms": round(t.t_serialize_ms, 20),
+            "t_http_overhead_ms": round(t.t_http_overhead_ms, 20),
+            "t_server_prefill_ms": round(t.t_server_prefill_ms, 20),
+            "t_decode_ms": round(t.t_decode_ms, 20),
+            "t_response_parse_ms": round(t.t_response_parse_ms, 20),
+            "t_e2e_ms": round(t.t_e2e_ms, 20),
+            "num_output_tokens": t.num_output_tokens,
+            "success": t.success,
+            "error": t.error,
+        })
+
+    output = {
+        "benchmark": "concurrency_driver_sweep",
+        "server_url": url,
+        "model": args.model,
+        "input_tokens": args.input_tokens,
+        "output_tokens": args.output_tokens,
+        "num_batches": args.num_batches,
+        "warmup_batches": args.warmup_batches,
+        "scenarios": args.scenarios,
+        "summaries": scenario_summaries,
+        "raw_traces": raw_traces,
+    }
+
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
+    print(f"\n[03_driver] Results saved to {out_path}")
+
+    # -------------------------------------------------------------------
+    # Summary table
+    # -------------------------------------------------------------------
+    print("\n" + "=" * 110)
+    print("CONCURRENCY SWEEP — Latency Breakdown (P95, ms)")
+    print("=" * 110)
+    header = (f"{'Conc':>6s} {'Requests':>8s} {'OK':>6s} "
+              f"{'Serialize':>12s} {'HTTP_OH':>12s} {'Prefill':>12s} "
+              f"{'Decode':>12s} {'Parse':>12s} {'E2E':>12s}")
+    print(header)
+    print("-" * 110)
+
+    for concurrency in args.scenarios:
+        s = scenario_summaries.get(str(concurrency), {})
+        if "error" in s:
+            print(f"{concurrency:>6d} {s['num_requests']:>8d} {'FAIL':>6s}")
+        else:
+            n = s["num_successful"]
+            print(f"{concurrency:>6d} {s['num_requests']:>8d} {n:>6d} "
+                  f"{s['t_serialize_ms']['p95']:>10.2f}ms "
+                  f"{s['t_http_overhead_ms']['p95']:>10.2f}ms "
+                  f"{s['t_server_prefill_ms']['p95']:>10.2f}ms "
+                  f"{s['t_decode_ms']['p95']:>10.2f}ms "
+                  f"{s['t_response_parse_ms']['p95']:>10.2f}ms "
+                  f"{s['t_e2e_ms']['p95']:>10.2f}ms")
+    print("=" * 110)
 
 
 if __name__ == "__main__":

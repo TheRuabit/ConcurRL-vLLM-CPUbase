@@ -1,58 +1,12 @@
-# Reference materials (not our work)
-reference/
-
-# Model weights (downloaded separately)
 models/
-
-# Result reference only
-result/
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-
-# Virtual environments
-.venv/
+reference/
 venv/
-env/
-
-# Build artifacts
-dist/
-build/
-*.egg
-
-# Vibe setting
-.claude/
-CLAUDE.md
-PLAN.md
-Analysis.md
-Phase1PLAN.md
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs
+__pycache__/
 *.log
-*.stdout
-*.stderr
+.env
+result/
+.claude/
 
-# Profiler output
-profiles/
-*.chrome_trace.json
-*.svg
-
-# Results backup
-result/*.bak
-
-# IDE
-.vscode/
-.idea/
-
-# 3rd party
-third_party/
+# Unrelevant file
+PLAN.md
+Phase1PLAN.md
