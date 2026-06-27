@@ -54,7 +54,7 @@ parser.add_argument("--max-num-seqs", type=int, default=1024,
                     help="Maximum number of sequences per iteration")
 parser.add_argument("--wait-only", action="store_true",
                     help="Only wait for an existing server to become healthy")
-parser.add_argument("--health-timeout", type=int, default=300,
+parser.add_argument("--health-timeout", type=int, default=40,
                     help="Seconds to wait for server health check")
 parser.add_argument("--log-file", default=None,
                     help="Redirect vLLM output to this file")

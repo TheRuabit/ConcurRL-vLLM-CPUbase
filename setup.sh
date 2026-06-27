@@ -34,7 +34,7 @@ done
 # -------------------------------------------------------------------
 TORCH_VERSION="2.11.0"
 TORCH_INDEX="https://mirrors.nju.edu.cn/pytorch/whl/cu128"
-VLLM_VERSION="0.21.0"
+VLLM_VERSION="0.23.0"
 
 AIOHTTP_VERSION="3.9.0"
 NUMPY_VERSION="1.26.0"
@@ -137,7 +137,7 @@ echo " Step 2/3: vLLM $VLLM_VERSION"
 echo "============================================"
 
 echo "[setup] Installing vllm==$VLLM_VERSION..."
-if pip install "vllm==$VLLM_VERSION" 2>&1 | tee /tmp/vllm_install.log; then
+if pip install "vllm==$VLLM_VERSION" 2>&1 | tee /$TMPDIR/vllm_install.log; then
     echo "[setup] vLLM installed successfully."
 else
     echo "[setup] vLLM $VLLM_VERSION failed — trying latest..."
