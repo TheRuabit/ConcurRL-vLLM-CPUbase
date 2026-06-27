@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
         --max_output_token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
         --max-output-token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
         --python)           PYTHON="$2";            shift 2 ;;
-        --skip_venv)        SKIP_VENV=true;         shift 2 ;;
+        --skip_venv)        SKIP_VENV=true;         shift  ;;
         -h|--help)
             echo "Usage: bash run_all.sh [OPTIONS]"
             echo ""
