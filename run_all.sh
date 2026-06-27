@@ -37,6 +37,7 @@ SERVER_URL="http://localhost:8000"
 MODEL="Qwen/Qwen3-30B-A3B"
 MAX_OUTPUT_TOKEN=64
 PYTHON="python"
+SKIP_VENV=false
 
 # -------------------------------------------------------------------
 # Parse arguments
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --max_output_token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
         --max-output-token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
         --python)           PYTHON="$2";            shift 2 ;;
+        --skip_venv)        SKIP_VENV=true;         shift 2 ;;
         -h|--help)
             echo "Usage: bash run_all.sh [OPTIONS]"
             echo ""
@@ -74,7 +76,7 @@ done
 # -------------------------------------------------------------------
 # Activate venv if present
 # -------------------------------------------------------------------
-if [ -f ".venv/bin/activate" ]; then
+if ! $SKIP_VENV && [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate 2>/dev/null || true
 elif [ -f ".venv/Scripts/activate" ]; then
     source .venv/Scripts/activate 2>/dev/null || true
