@@ -6,12 +6,13 @@ Issues burst requests concurrently via aiohttp while capturing 5 latency
 metrics per request. Sequentially steps through concurrency tiers
 [32, 128, 256, 512, 1024], dumping raw performance arrays to JSON.
 
-Metric Hook Mapping:
+Metric Hook Mapping (aligned with reference/04_server_decomposition.py):
   t_serialize        — client JSON serialization time
-  t_http_overhead    — POST → first SSE byte (server scheduling + queue wait)
+  t_first_byte       — POST → first SSE byte  (HTTP overhead on localhost)
   t_server_prefill   — POST → first content token (TTFT from client perspective)
+  t_prefill          — TTFT − first_byte       (pure GPU attention over input)
   t_decode           — first → last content token interval
-  t_response_parse   — SSE chunk parsing time
+  t_response_parse   — first byte → end of SSE stream
 
 Default: input 32k tokens → output 64 tokens
 
@@ -140,8 +141,9 @@ class RequestTrace:
     idx: int = 0
     input_tokens: int = 0
     t_serialize_ms: float = 0.0
-    t_http_overhead_ms: float = 0.0
+    t_first_byte_ms: float = 0.0
     t_server_prefill_ms: float = 0.0
+    t_prefill_ms: float = 0.0
     t_decode_ms: float = 0.0
     t_response_parse_ms: float = 0.0
     t_e2e_ms: float = 0.0
@@ -177,6 +179,8 @@ async def trace_one_request(
 
     async with semaphore:
         try:
+            t_first_byte = None
+
             async with session.post(
                 f"{url}/v1/chat/completions",
                 data=body,
@@ -184,7 +188,7 @@ async def trace_one_request(
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 t_first_byte = time.perf_counter()
-                t.t_http_overhead_ms = (t_first_byte - t_post) * 1000
+                t.t_first_byte_ms = (t_first_byte - t_post) * 1000
 
                 if resp.status != 200:
                     err = await resp.text()
@@ -193,6 +197,7 @@ async def trace_one_request(
                     t.t_e2e_ms = (time.perf_counter() - e2e_start) * 1000
                     return t
 
+                first_byte = False
                 first_token = False
                 t_first_token = None
                 t_last_token = None
@@ -200,7 +205,8 @@ async def trace_one_request(
                 token_count = 0
 
                 async for line in resp.content:
-                    if parse_start is None:
+                    if not first_byte:
+                        first_byte = True
                         parse_start = time.perf_counter()
 
                     line_str = line.decode("utf-8").strip()
@@ -220,6 +226,8 @@ async def trace_one_request(
                         except json.JSONDecodeError:
                             pass
 
+                if first_token and t_first_byte:
+                    t.t_prefill_ms = max(0, t.t_server_prefill_ms - t.t_first_byte_ms)
                 if parse_start:
                     t.t_response_parse_ms = (time.perf_counter() - parse_start) * 1000
                 if first_token and t_last_token:
@@ -323,8 +331,9 @@ async def main():
                     "num_requests": len(scenario_traces),
                     "num_successful": len(successful),
                     "t_serialize_ms": compute_stats([r.t_serialize_ms for r in successful]),
-                    "t_http_overhead_ms": compute_stats([r.t_http_overhead_ms for r in successful]),
+                    "t_first_byte_ms": compute_stats([r.t_first_byte_ms for r in successful]),
                     "t_server_prefill_ms": compute_stats([r.t_server_prefill_ms for r in successful]),
+                    "t_prefill_ms": compute_stats([r.t_prefill_ms for r in successful]),
                     "t_decode_ms": compute_stats([r.t_decode_ms for r in successful]),
                     "t_response_parse_ms": compute_stats([r.t_response_parse_ms for r in successful]),
                     "t_e2e_ms": compute_stats([r.t_e2e_ms for r in successful]),
@@ -351,8 +360,9 @@ async def main():
             "idx": t.idx,
             "input_tokens": t.input_tokens,
             "t_serialize_ms": round(t.t_serialize_ms, 20),
-            "t_http_overhead_ms": round(t.t_http_overhead_ms, 20),
+            "t_first_byte_ms": round(t.t_first_byte_ms, 20),
             "t_server_prefill_ms": round(t.t_server_prefill_ms, 20),
+            "t_prefill_ms": round(t.t_prefill_ms, 20),
             "t_decode_ms": round(t.t_decode_ms, 20),
             "t_response_parse_ms": round(t.t_response_parse_ms, 20),
             "t_e2e_ms": round(t.t_e2e_ms, 20),
@@ -380,14 +390,14 @@ async def main():
     # -------------------------------------------------------------------
     # Summary table
     # -------------------------------------------------------------------
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 130)
     print("CONCURRENCY SWEEP — Latency Breakdown (P95, ms)")
-    print("=" * 110)
+    print("=" * 130)
     header = (f"{'Conc':>6s} {'Requests':>8s} {'OK':>6s} "
-              f"{'Serialize':>12s} {'HTTP_OH':>12s} {'Prefill':>12s} "
-              f"{'Decode':>12s} {'Parse':>12s} {'E2E':>12s}")
+              f"{'Serialize':>10s} {'1stByte':>10s} {'TTFT':>10s} "
+              f"{'Prefill':>10s} {'Decode':>10s} {'Parse':>10s} {'E2E':>10s}")
     print(header)
-    print("-" * 110)
+    print("-" * 130)
 
     for concurrency in args.scenarios:
         s = scenario_summaries.get(str(concurrency), {})
@@ -396,13 +406,14 @@ async def main():
         else:
             n = s["num_successful"]
             print(f"{concurrency:>6d} {s['num_requests']:>8d} {n:>6d} "
-                  f"{s['t_serialize_ms']['p95']:>10.2f}ms "
-                  f"{s['t_http_overhead_ms']['p95']:>10.2f}ms "
-                  f"{s['t_server_prefill_ms']['p95']:>10.2f}ms "
-                  f"{s['t_decode_ms']['p95']:>10.2f}ms "
-                  f"{s['t_response_parse_ms']['p95']:>10.2f}ms "
-                  f"{s['t_e2e_ms']['p95']:>10.2f}ms")
-    print("=" * 110)
+                  f"{s['t_serialize_ms']['p95']:>8.2f}ms "
+                  f"{s['t_first_byte_ms']['p95']:>8.2f}ms "
+                  f"{s['t_server_prefill_ms']['p95']:>8.2f}ms "
+                  f"{s['t_prefill_ms']['p95']:>8.2f}ms "
+                  f"{s['t_decode_ms']['p95']:>8.2f}ms "
+                  f"{s['t_response_parse_ms']['p95']:>8.2f}ms "
+                  f"{s['t_e2e_ms']['p95']:>8.2f}ms")
+    print("=" * 130)
 
 
 if __name__ == "__main__":

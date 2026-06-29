@@ -121,8 +121,9 @@ def main():
     # Compute per-tier statistics
     metric_keys = [
         "t_serialize_ms",
-        "t_http_overhead_ms",
+        "t_first_byte_ms",
         "t_server_prefill_ms",
+        "t_prefill_ms",
         "t_decode_ms",
         "t_response_parse_ms",
         "t_e2e_ms",
@@ -155,10 +156,12 @@ def main():
             values = [t[key] for t in successful if key in t]
             tier_stats[key] = compute_full_stats(values)
 
-        # Derived: CPU vs GPU breakdown
-        cpu_times = [t["t_serialize_ms"] + t["t_http_overhead_ms"]
+        # Derived: CPU vs GPU breakdown (aligned with reference decomposition)
+        #   CPU = serialize + HTTP overhead (first_byte on localhost)
+        #   GPU = pure prefill (TTFT − first_byte) + decode
+        cpu_times = [t["t_serialize_ms"] + t["t_first_byte_ms"]
                      for t in successful]
-        gpu_times = [t["t_server_prefill_ms"] + t["t_decode_ms"]
+        gpu_times = [t["t_prefill_ms"] + t["t_decode_ms"]
                      for t in successful]
         total_times = [c + g for c, g in zip(cpu_times, gpu_times)]
 
@@ -209,21 +212,22 @@ def main():
     # Main latency table (P95)
     lines.append("## Latency Breakdown (P95, ms)\n")
     lines.append("| Concurrency | Client Serialization ($P_{95}$) | "
-                 "Server Overhead ($P_{95}$) | GPU Prefill ($P_{95}$) | "
-                 "GPU Decode ($P_{95}$) | Response Parsing ($P_{95}$) | "
-                 "Status / Degradation Source |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+                 "HTTP Overhead ($P_{95}$) | TTFT ($P_{95}$) | "
+                 "GPU Prefill ($P_{95}$) | GPU Decode ($P_{95}$) | "
+                 "Response Parsing ($P_{95}$) | Status / Degradation Source |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
 
     for level in scenarios:
         tier = compiled_tiers.get(str(level), {})
         if not tier or tier.get("successful", 0) == 0:
-            lines.append(f"| **{level}** | — | — | — | — | — | Failed |")
+            lines.append(f"| **{level}** | — | — | — | — | — | — | Failed |")
             continue
 
         s = tier
         ser = f"{s['t_serialize_ms']['p95']:.1f}ms"
-        ohs = f"{s['t_http_overhead_ms']['p95']:.1f}ms"
-        pre = f"{s['t_server_prefill_ms']['p95']:.1f}ms"
+        fb = f"{s['t_first_byte_ms']['p95']:.1f}ms"
+        ttft = f"{s['t_server_prefill_ms']['p95']:.1f}ms"
+        pre = f"{s['t_prefill_ms']['p95']:.1f}ms"
         dec = f"{s['t_decode_ms']['p95']:.1f}ms"
         par = f"{s['t_response_parse_ms']['p95']:.1f}ms"
 
@@ -237,7 +241,7 @@ def main():
         else:
             status = "Server Breakdown"
 
-        lines.append(f"| **{level}** | {ser} | {ohs} | {pre} | {dec} | {par} | {status} |")
+        lines.append(f"| **{level}** | {ser} | {fb} | {ttft} | {pre} | {dec} | {par} | {status} |")
 
     # Detailed stats table (mean/P50/P95/P99)
     lines.append("\n## Detailed Statistics (ms)\n")
@@ -246,8 +250,9 @@ def main():
 
     metric_labels = {
         "t_serialize_ms": "Client Serialization",
-        "t_http_overhead_ms": "Server Overhead",
-        "t_server_prefill_ms": "GPU Prefill (TTFT)",
+        "t_first_byte_ms": "HTTP Overhead",
+        "t_server_prefill_ms": "TTFT",
+        "t_prefill_ms": "GPU Prefill",
         "t_decode_ms": "GPU Decode",
         "t_response_parse_ms": "Response Parsing",
         "t_e2e_ms": "End-to-End",
@@ -297,14 +302,14 @@ def main():
     # -------------------------------------------------------------------
     # Console summary
     # -------------------------------------------------------------------
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 130)
     print("METRICS COMPILER — P95 Latency Summary (ms)")
-    print("=" * 110)
-    header = (f"{'Conc':>6s} {'Serialize':>12s} {'HTTP_OH':>12s} "
-              f"{'Prefill':>12s} {'Decode':>12s} {'Parse':>12s} "
-              f"{'E2E':>12s} {'CPU%':>7s} {'GPU%':>7s}")
+    print("=" * 130)
+    header = (f"{'Conc':>6s} {'Serialize':>10s} {'1stByte':>10s} {'TTFT':>10s} "
+              f"{'Prefill':>10s} {'Decode':>10s} {'Parse':>10s} "
+              f"{'E2E':>10s} {'CPU%':>7s} {'GPU%':>7s}")
     print(header)
-    print("-" * 110)
+    print("-" * 130)
 
     for level in scenarios:
         tier = compiled_tiers.get(str(level), {})
@@ -312,15 +317,16 @@ def main():
             print(f"{level:>6d} {'FAIL':>12s}")
             continue
         print(f"{level:>6d} "
-              f"{tier['t_serialize_ms']['p95']:>10.2f}ms "
-              f"{tier['t_http_overhead_ms']['p95']:>10.2f}ms "
-              f"{tier['t_server_prefill_ms']['p95']:>10.2f}ms "
-              f"{tier['t_decode_ms']['p95']:>10.2f}ms "
-              f"{tier['t_response_parse_ms']['p95']:>10.2f}ms "
-              f"{tier['t_e2e_ms']['p95']:>10.2f}ms "
+              f"{tier['t_serialize_ms']['p95']:>8.2f}ms "
+              f"{tier['t_first_byte_ms']['p95']:>8.2f}ms "
+              f"{tier['t_server_prefill_ms']['p95']:>8.2f}ms "
+              f"{tier['t_prefill_ms']['p95']:>8.2f}ms "
+              f"{tier['t_decode_ms']['p95']:>8.2f}ms "
+              f"{tier['t_response_parse_ms']['p95']:>8.2f}ms "
+              f"{tier['t_e2e_ms']['p95']:>8.2f}ms "
               f"{tier.get('cpu_percent', 0):>6.1f}% "
               f"{tier.get('gpu_percent', 0):>6.1f}%")
-    print("=" * 110)
+    print("=" * 130)
 
 
 if __name__ == "__main__":
