@@ -54,6 +54,11 @@ parser.add_argument("--max-num-seqs", type=int, default=1024,
                     help="Maximum number of sequences per iteration")
 parser.add_argument("--wait-only", action="store_true",
                     help="Only wait for an existing server to become healthy")
+parser.add_argument("--detach", action="store_true",
+                    help="Launch server, wait for health, write PID file, then exit "
+                         "(for use by run_all.sh)")
+parser.add_argument("--pid-file", default=None,
+                    help="Write vLLM subprocess PID to this file (used with --detach)")
 parser.add_argument("--health-timeout", type=int, default=200,
                     help="Seconds to wait for server health check")
 parser.add_argument("--log-file", default=None,
@@ -151,6 +156,19 @@ def main():
             process.terminate()
             process.wait(timeout=10)
             sys.exit(1)
+
+        # Detach mode: write PID file and exit (caller manages lifecycle)
+        if args.detach:
+            pid_path = Path(args.pid_file) if args.pid_file else \
+                       Path(__file__).resolve().parents[1] / "result" / "vllm_server.pid"
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_path.write_text(str(process.pid), encoding="utf-8")
+            print(f"[02_launch] vLLM server running at http://{args.host}:{args.port}")
+            print(f"[02_launch] PID: {process.pid} (written to {pid_path})")
+            # Do NOT wait — let caller manage the server
+            if log_handle:
+                log_handle.close()
+            return
 
         print(f"\n[02_launch] vLLM server running at http://{args.host}:{args.port}")
         print(f"[02_launch] Press Ctrl+C to stop\n")

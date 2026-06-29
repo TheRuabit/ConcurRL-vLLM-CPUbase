@@ -22,6 +22,7 @@
 #   bash run_all.sh --phase 1 --model ./models/Qwen3-30B-A3B
 #   bash run_all.sh --phase 1 --max_output_token 128
 #   bash run_all.sh --phase 1 --url http://localhost:8000
+#   bash run_all.sh --phase 1 --keep-vllm              # Keep server alive after run
 # ==============================================================================
 
 set -euo pipefail
@@ -38,6 +39,7 @@ MODEL="Qwen/Qwen3-30B-A3B"
 MAX_OUTPUT_TOKEN=64
 PYTHON="python"
 SKIP_VENV=false
+KEEP_VLLM=false
 
 # -------------------------------------------------------------------
 # Parse arguments
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --max-output-token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
         --python)           PYTHON="$2";            shift 2 ;;
         --skip_venv)        SKIP_VENV=true;         shift  ;;
+        --keep-vllm)        KEEP_VLLM=true;         shift  ;;
         -h|--help)
             echo "Usage: bash run_all.sh [OPTIONS]"
             echo ""
@@ -63,6 +66,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --max_output_token <N>  Max output tokens per request (default: 64)"
             echo "  --url <url>             vLLM server URL (default: http://localhost:8000)"
             echo "  --python <cmd>          Python interpreter (default: python)"
+            echo "  --keep-vllm             Keep vLLM server running after pipeline completes"
             exit 0
             ;;
         *)
@@ -95,6 +99,7 @@ echo " Phase:             $PHASE"
 echo " Model:             $MODEL"
 echo " Max Output Tokens: $MAX_OUTPUT_TOKEN"
 echo " Server URL:        $SERVER_URL"
+echo " Keep vLLM:         $KEEP_VLLM"
 echo "============================================"
 echo ""
 
@@ -119,6 +124,8 @@ run_phase_test() {
 # ===================================================================
 # Phase 1: Concurrency Scaling Validation
 # ===================================================================
+VLLM_PID_FILE=""
+
 run_phase_1() {
     echo "==========================================="
     echo " PHASE 1: Concurrency Scaling Validation"
@@ -126,38 +133,18 @@ run_phase_1() {
 
     # Check if server is already running
     echo "[Phase1] Checking server at $SERVER_URL ..."
-    SERVER_RUNNING=false
     if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
-        echo "[Phase1] Server already running."
-        SERVER_RUNNING=true
-    fi
-
-    # Launch vLLM server if not running
-    if ! $SERVER_RUNNING; then
+        echo "[Phase1] Server already running, skipping launch."
+    else
         echo ""
         echo "--- 02 Launch vLLM Server ---"
         echo "[Phase1] Starting vLLM server (this may take a few minutes)..."
+        VLLM_PID_FILE="result/vllm_server.pid"
         $PYTHON script/02_launch_vllm.py \
             --model "$MODEL" \
             --port "${SERVER_URL##*:}" \
-            &
-        VLLM_PID=$!
-        echo "[Phase1] vLLM server PID: $VLLM_PID"
-
-        # Wait for health
-        echo "[Phase1] Waiting for server to become healthy..."
-        for i in $(seq 1 60); do
-            if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
-                echo "[Phase1] Server ready after ${i}x5s."
-                break
-            fi
-            if [ "$i" -eq 60 ]; then
-                echo "[Phase1] ERROR: Server did not become healthy in 300s."
-                kill $VLLM_PID 2>/dev/null || true
-                exit 1
-            fi
-            sleep 5
-        done
+            --detach \
+            --pid-file "$VLLM_PID_FILE"
     fi
 
     # Concurrency sweep
@@ -178,14 +165,6 @@ run_phase_1() {
     $PYTHON script/04_metrics_compiler.py
     echo "  OK: result/04_metrics_compiler.json"
     echo "  OK: PHASE_1_SUMMARY.md"
-
-    # Clean up vLLM server if we launched it
-    if [ -n "${VLLM_PID:-}" ]; then
-        echo ""
-        echo "[Phase1] Stopping vLLM server (PID: $VLLM_PID)..."
-        kill $VLLM_PID 2>/dev/null || true
-        wait $VLLM_PID 2>/dev/null || true
-    fi
 
     echo ""
     echo "[Phase 1] Complete. Results in ./result/ and PHASE_1_SUMMARY.md"
@@ -251,6 +230,24 @@ case "$PHASE" in
         exit 1
         ;;
 esac
+
+# -------------------------------------------------------------------
+# Cleanup: stop vLLM server unless --keep-vllm
+# -------------------------------------------------------------------
+if [ -n "${VLLM_PID_FILE:-}" ] && [ -f "$VLLM_PID_FILE" ]; then
+    VLLM_PID=$(cat "$VLLM_PID_FILE")
+    if $KEEP_VLLM; then
+        echo ""
+        echo "[Cleanup] --keep-vllm: vLLM server left running (PID: $VLLM_PID)"
+    else
+        echo ""
+        echo "[Cleanup] Stopping vLLM server (PID: $VLLM_PID)..."
+        kill "$VLLM_PID" 2>/dev/null || true
+        wait "$VLLM_PID" 2>/dev/null || true
+        rm -f "$VLLM_PID_FILE"
+        echo "[Cleanup] vLLM server stopped."
+    fi
+fi
 
 echo ""
 echo "============================================"

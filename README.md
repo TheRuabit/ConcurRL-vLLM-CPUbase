@@ -1,173 +1,160 @@
 # ConcurRL-vLLM
 
-Advanced concurrency and latency benchmarking for agentic RL backends on vLLM.
+Concurrency and latency benchmarking for agentic RL backends on vLLM.
 
-## What This Project Does
+## Overview
 
-Reinforcement learning (RL) pipelines that use LLMs as policy or reward models need to run hundreds to thousands of environment rollouts in parallel. The central question this project answers:
+RL pipelines that use LLMs as policy or reward models need hundreds to thousands of parallel rollouts. This project measures how CPU-side scheduling, thread contention, and OS-level context switching degrade latency as concurrency scales from 32 to 1024 on a vLLM backend.
 
-> **How does CPU-side scheduling, thread contention, and OS-level context switching degrade latency as concurrency scales from 32 to 1024 parallel rollouts on a vLLM backend?**
+Each request is decomposed into non-overlapping timed segments:
 
-We isolate the CPU scheduling bottleneck from GPU compute by decomposing each request into 5 timed segments:
+| Metric               | What It Captures                                                             |
+| -------------------- | ---------------------------------------------------------------------------- |
+| Client Serialization | JSON payload serialization on the client                                     |
+| HTTP Overhead        | POST → first SSE byte (scheduling, queue wait, KV cache lookup on localhost) |
+| TTFT                 | POST → first content token (HTTP overhead + GPU prefill)                     |
+| GPU Prefill          | Pure GPU attention over input tokens (TTFT − HTTP overhead)                  |
+| GPU Decode           | Autoregressive token generation (first → last token)                         |
+| Response Parsing     | Client-side SSE stream consumption (first byte → end of stream)              |
 
-| Metric | What It Captures |
-|---|---|
-| Client Serialization | Time to serialize the JSON payload on the client side |
-| Server HTTP Overhead | Scheduling, queue wait, and KV cache lookup before GPU work starts |
-| GPU Prefill (TTFT) | Time from POST to first content token — includes overhead + prefill attention |
-| GPU Decode | Autoregressive token generation interval (first → last token) |
-| Response Parsing | Client-side SSE chunk parsing after the last token arrives |
-
-By sweeping concurrency across `[32, 128, 256, 512, 1024]` and tracking these metrics, we can pinpoint exactly where the system transitions from nominal execution to queue contention to context-switch thrashing — and use that data to design targeted mitigations in Phase 3.
+CPU time = Serialization + HTTP Overhead. GPU time = Prefill + Decode. These are non-overlapping and sum to E2E.
 
 ## Project Phases
 
-### Phase 1: Concurrency Scaling Validation (Stress Testing)
-- Set up mock environments and timing hooks to validate instrumentation
-- Deploy vLLM with dual-GPU tensor parallelism
-- Run async concurrency sweeps from 32 to 1024 parallel requests
-- Collect per-request latency decomposition and OS-level telemetry
+**Phase 1 — Concurrency Scaling Validation**: Async concurrency sweeps [32, 128, 256, 512, 1024] with per-request latency decomposition. (Current)
 
-### Phase 2: Full RL Loop Integration
-- Bridge the high-concurrency generation phase with centralized GPU/CPU training
-- Measure overhead during the generation ↔ training phase transitions
+**Phase 2 — Full RL Loop Integration**: Measure overhead during generation ↔ training phase transitions. (TODO)
 
-### Phase 3: Analysis & Solution Design
-- Parse execution timelines to find exact CPU stall and thrash points
-- Prototype mitigations: scheduling-aware batching, dynamic thread pooling, async rollout/train overlaps
+**Phase 3 — Analysis & Solution Design**: Bottleneck profiling and mitigation prototyping. (TODO)
 
 ## Hardware Requirements
 
-- **GPUs**: 2x NVIDIA A800-80GB (or equivalent with 80GB+ VRAM each)
-- **VRAM Usage**: ~64GB for FP16 model weights (Qwen3-30B-A3B with TP=2), ~96GB free for KV cache
-- **CPU**: Multi-core Xeon or equivalent (contention on this is what we're measuring)
+- **GPUs**: 2x NVIDIA A800-80GB (or equivalent, 80GB+ VRAM each)
+- **VRAM**: ~64GB for FP16 weights (Qwen3-30B-A3B, TP=2), remainder for KV cache
+- **CPU**: Multi-core Xeon or equivalent
 - **RAM**: 128GB+ recommended
 
 ## Setup
 
 ```bash
-# Clone and enter project
 cd ConcurRL-vLLM-CPUbase
-
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate        # Linux
 # venv\Scripts\activate         # Windows
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### Dependencies
+| Package               | Purpose                                  |
+| --------------------- | ---------------------------------------- |
+| `vllm>=0.4.0`         | LLM serving engine                       |
+| `aiohttp`             | Async HTTP client for concurrency driver |
+| `fastapi` + `uvicorn` | Mock server for compile check            |
+| `pydantic`            | Data validation                          |
+| `numpy`               | Numerical operations                     |
+| `psutil`              | OS-level telemetry                       |
 
-| Package | Purpose |
-|---|---|
-| `vllm>=0.4.0` | LLM serving engine |
-| `aiohttp` | Async HTTP client for concurrency driver |
-| `fastapi` + `uvicorn` | Mock server for compile check |
-| `pydantic` | Data validation |
-| `numpy` | Numerical operations |
-| `psutil` | OS-level telemetry |
+## Quick Start (run_all.sh)
 
-## Execution Order
+The easiest way to run the full pipeline:
 
-### Step 1: Compile Check (no model download needed)
+```bash
+# Phase 1: compile check + vLLM concurrency sweep
+bash run_all.sh --phase 1
 
-Validates that all 5 timing hooks work correctly using a lightweight mock server.
+# Keep vLLM server alive after completion (for further experiments)
+bash run_all.sh --phase 1 --keep-vllm
+
+# All phases
+bash run_all.sh --phase all
+
+# Custom model and output tokens
+bash run_all.sh --phase 1 --model ./models/Qwen3-30B-A3B --max_output_token 128
+```
+
+`run_all.sh` launches vLLM automatically, runs all steps, and cleans up the server on exit (unless `--keep-vllm`).
+
+## Manual Execution
+
+### Step 1: Compile Check
+
+Validates timing hooks using a lightweight mock server (no model download needed):
 
 ```bash
 python script/01_compile_check.py
-python script/01_compile_check.py --concurrency 8 --input-tokens 500
 ```
 
 Output: `result/01_compile_check.json`
 
 ### Step 2: Download Model
 
-Retrieve the model weights once (skip if already cached locally):
-
 ```bash
-# The scripts default to "Qwen/Qwen3-30B-A3B"
-# vLLM will auto-download from HuggingFace on first launch,
-# or you can pre-download:
 huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir ./models/Qwen3-30B-A3B
 ```
 
-### Step 3: Launch vLLM Server
+vLLM will also auto-download on first launch.
 
-Start the production vLLM backend across both GPUs:
+### Step 3: Launch vLLM Server
 
 ```bash
 python script/02_launch_vllm.py
 python script/02_launch_vllm.py --model ./models/Qwen3-30B-A3B --port 8000
 ```
 
-Key flags (hardcoded defaults match Phase1Plan.md):
-- `--tensor-parallel-size 2` — uses both CUDA 0 and CUDA 1
-- `--max-model-len 4096` — context window cap
-- `--enable-chunked-prefill` — shields RL loop from scheduling thrashing at 512+ concurrency
-- `--gpu-memory-utilization 0.85` — leaves headroom for KV cache
+Key flags: `--tensor-parallel-size 2`, `--max-model-len 51200`, `--enable-chunked-prefill`, `--gpu-memory-utilization 0.85`. Use `--detach --pid-file <path>` to launch in background (exits after health check, writes PID to file).
 
 ### Step 4: Concurrency Stress Test
-
-Run the async profiler across all concurrency tiers:
 
 ```bash
 python script/03_concurrency_driver.py --url http://localhost:8000
 python script/03_concurrency_driver.py --url http://localhost:8000 --scenarios 32 128 256
-python script/03_concurrency_driver.py --url http://localhost:8000 --num-batches 5 --warmup-batches 2
 ```
 
-Default sweep: `[32, 128, 256, 512, 1024]` concurrent requests with 32k input / 64 output tokens.
+Default sweep: [32, 128, 256, 512, 1024] concurrent requests, 32k input / 64 output tokens, 3 batches.
 
 Output: `result/03_concurrency_driver.json`
 
 ### Step 5: Compile Metrics & Generate Report
-
-Aggregate raw traces into percentile statistics and a Markdown summary:
 
 ```bash
 python script/04_metrics_compiler.py
 ```
 
 Output:
-- `result/04_metrics_compiler.json` — structured analytics per concurrency tier
-- `PHASE_1_SUMMARY.md` — scannable benchmark table with P50/P95/P99 breakdowns
+
+- `result/04_metrics_compiler.json` — structured analytics per tier
+- `PHASE_1_SUMMARY.md` — benchmark tables with P50/P95/P99 breakdowns
 
 ## File Structure
 
 ```text
 ConcurRL-vLLM-CPUbase/
-├── .gitignore
+├── run_all.sh                      # One-command pipeline orchestration
 ├── README.md
 ├── PHASE_1_SUMMARY.md              # Generated benchmark report
-├── Phase1PLAN.md                   # Detailed Phase 1 blueprint
-├── PLAN.md                         # Full project roadmap (3 phases)
+├── Phase1PLAN.md                   # Phase 1 blueprint
+├── PLAN.md                         # Full project roadmap
 ├── requirements.txt
 │
 ├── script/
-│   ├── __init__.py
 │   ├── 01_compile_check.py         # Mock server + client timing validation
-│   ├── 02_launch_vllm.py           # Production vLLM subprocess launcher (TP=2)
+│   ├── 02_launch_vllm.py           # vLLM server launcher (supports --detach)
 │   ├── 03_concurrency_driver.py    # Async burst profiler (32 → 1024)
-│   └── 04_metrics_compiler.py      # JSON aggregator + Markdown visualizer
+│   └── 04_metrics_compiler.py      # JSON aggregator + Markdown report
 │
-├── result/
-│   ├── 01_compile_check.json       # Timing validation results
-│   ├── 03_concurrency_driver.json  # Raw per-request traces
-│   └── 04_metrics_compiler.json    # Aggregated P50/P95/P99 analytics
+├── result/                         # All output JSONs and PID files
 │
 └── reference/
-    └── 04_server_decomposition.py  # Reference coding style (HBM prefix cache benchmark)
+    └── 04_server_decomposition.py  # Reference decomposition (HBM prefix cache)
 ```
 
 ## CLI Reference
 
-All scripts support `--help` for full flag documentation.
+All scripts support `--help`.
 
-| Script | Key Flags | Default |
-|---|---|---|
-| `01_compile_check.py` | `--concurrency`, `--input-tokens`, `--output-tokens`, `--port` | 4 concurrent, 100 input tokens |
-| `02_launch_vllm.py` | `--model`, `--port`, `--tensor-parallel-size`, `--max-model-len`, `--wait-only` | Qwen3-30B-A3B, port 8000, TP=2 |
-| `03_concurrency_driver.py` | `--url`, `--scenarios`, `--num-batches`, `--input-tokens`, `--output-tokens` | localhost:8000, [32..1024], 3 batches |
-| `04_metrics_compiler.py` | `--input`, `--output-json`, `--output-md` | Reads from `result/03_*.json` |
+| Script                     | Key Flags                                                                                                 | Default                               |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `01_compile_check.py`      | `--concurrency`, `--input-tokens`, `--output-tokens`                                                      | 4 concurrent, 100 input tokens        |
+| `02_launch_vllm.py`        | `--model`, `--port`, `--tensor-parallel-size`, `--max-model-len`, `--detach`, `--pid-file`, `--wait-only` | Qwen3-30B-A3B, port 8000, TP=2        |
+| `03_concurrency_driver.py` | `--url`, `--scenarios`, `--num-batches`, `--input-tokens`, `--output-tokens`                              | localhost:8000, [32..1024], 3 batches |
+| `04_metrics_compiler.py`   | `--input`, `--output-json`, `--output-md`                                                                 | Reads from `result/03_*.json`         |
+| `run_all.sh`               | `--phase`, `--model`, `--url`, `--max_output_token`, `--keep-vllm`                                        | phase=all, Qwen3-30B-A3B              |
