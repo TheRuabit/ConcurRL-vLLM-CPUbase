@@ -6,7 +6,10 @@ __pycache__/
 .env
 result/
 .claude/
+.mimocode/
 
 # Unrelevant file
 PLAN.md
 Phase1PLAN.md
+Phase2PLAN.md
+CLAUDE.md

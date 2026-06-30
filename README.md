@@ -21,9 +21,9 @@ CPU time = Serialization + HTTP Overhead. GPU time = Prefill + Decode. These are
 
 ## Project Phases
 
-**Phase 1 — Concurrency Scaling Validation**: Async concurrency sweeps [32, 128, 256, 512, 1024] with per-request latency decomposition. (Current)
+**Phase 1 — Concurrency Scaling Validation**: Async concurrency sweeps [32, 128, 256, 512, 1024] with per-request latency decomposition.
 
-**Phase 2 — Full RL Loop Integration**: Measure overhead during generation ↔ training phase transitions. (TODO)
+**Phase 2 — Full RL Loop Integration**: GRPO training via veRL, measuring per-step timing breakdown (rollout → reward → advantage → train → weight sync) to validate Phase 1's CPU bottleneck finding inside a real RL loop.
 
 **Phase 3 — Analysis & Solution Design**: Bottleneck profiling and mitigation prototyping. (TODO)
 
@@ -60,6 +60,9 @@ The easiest way to run the full pipeline:
 ```bash
 # Phase 1: compile check + vLLM concurrency sweep
 bash run_all.sh --phase 1
+
+# Phase 2: GRPO RL loop via veRL (downloads DAPO-Math-17k automatically)
+bash run_all.sh --phase 2
 
 # Keep vLLM server alive after completion (for further experiments)
 bash run_all.sh --phase 1 --keep-vllm
@@ -130,8 +133,9 @@ Output:
 ConcurRL-vLLM-CPUbase/
 ├── run_all.sh                      # One-command pipeline orchestration
 ├── README.md
-├── PHASE_1_SUMMARY.md              # Generated benchmark report
-├── Phase1PLAN.md                   # Phase 1 blueprint
+├── PHASE_1_SUMMARY.md              # Phase 1 benchmark report
+├── PHASE_2_SUMMARY.md              # Phase 2 GRPO timing report
+├── Phase1PLAN.md / Phase2PLAN.md   # Phase blueprints
 ├── PLAN.md                         # Full project roadmap
 ├── requirements.txt
 │
@@ -139,7 +143,14 @@ ConcurRL-vLLM-CPUbase/
 │   ├── 01_compile_check.py         # Mock server + client timing validation
 │   ├── 02_launch_vllm.py           # vLLM server launcher (supports --detach)
 │   ├── 03_concurrency_driver.py    # Async burst profiler (32 → 1024)
-│   └── 04_metrics_compiler.py      # JSON aggregator + Markdown report
+│   ├── 04_metrics_compiler.py      # JSON aggregator + Markdown report
+│   ├── 05_grpo_train.py            # Phase 2: GRPO training via veRL
+│   ├── 06_math_reward.py           # Phase 2: math reward function with timing
+│   └── 07_phase2_metrics.py        # Phase 2: timing compiler
+│
+├── data/                           # Datasets (auto-downloaded)
+│   ├── dapo-math-17k.parquet
+│   └── aime-2024.parquet
 │
 ├── result/                         # All output JSONs and PID files
 │
@@ -157,4 +168,6 @@ All scripts support `--help`.
 | `02_launch_vllm.py`        | `--model`, `--port`, `--tensor-parallel-size`, `--max-model-len`, `--detach`, `--pid-file`, `--wait-only` | Qwen3-30B-A3B, port 8000, TP=2        |
 | `03_concurrency_driver.py` | `--url`, `--scenarios`, `--num-batches`, `--input-tokens`, `--output-tokens`                              | localhost:8000, [32..1024], 3 batches |
 | `04_metrics_compiler.py`   | `--input`, `--output-json`, `--output-md`                                                                 | Reads from `result/03_*.json`         |
+| `05_grpo_train.py`         | `--model`, `--rollout-n`, `--train-batch-size`, `--num-epochs`, `--reward-func`                           | rollout_n=8, batch=32, epochs=3       |
+| `07_phase2_metrics.py`     | `--input`, `--output-json`, `--output-md`                                                                 | Reads from `result/05_*.json`         |
 | `run_all.sh`               | `--phase`, `--model`, `--url`, `--max_output_token`, `--keep-vllm`                                        | phase=all, Qwen3-30B-A3B              |

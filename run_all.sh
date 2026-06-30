@@ -12,7 +12,11 @@
 #     03_concurrency_driver.py (async sweep 32 → 1024)
 #     04_metrics_compiler.py   (JSON aggregator + Markdown report)
 #
-#   Phase 2 — Full RL Loop Integration    [TODO]
+#   Phase 2 — Full RL Loop Integration (veRL GRPO)
+#     05_grpo_train.py        (GRPO training via veRL)
+#     06_math_reward.py        (math reward function)
+#     07_phase2_metrics.py     (Phase 2 timing compiler)
+#
 #   Phase 3 — Analysis & Solution Design  [TODO]
 #
 # Usage:
@@ -58,9 +62,10 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: bash run_all.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --phase <test|1|all>    Which phase to run (default: all)"
+            echo "  --phase <test|1|2|all>  Which phase to run (default: all)"
             echo "                          test  = 01_compile_check.py (mock server)"
             echo "                          1     = 02+03+04 (vLLM concurrency sweep)"
+            echo "                          2     = 05+06+07 (GRPO RL loop via veRL)"
             echo "                          all   = all phases"
             echo "  --model <path>          Model name or path (default: Qwen/Qwen3-30B-A3B)"
             echo "  --max_output_token <N>  Max output tokens per request (default: 64)"
@@ -171,16 +176,56 @@ run_phase_1() {
 }
 
 # ===================================================================
-# Phase 2: Full RL Loop Integration [TODO]
+# Phase 2: Full RL Loop Integration (veRL GRPO)
 # ===================================================================
 run_phase_2() {
     echo "==========================================="
     echo " PHASE 2: Full RL Loop Integration"
     echo "==========================================="
-    echo "[Phase 2] Not yet implemented."
-    echo "[Phase 2] Will cover: alternation mechanics, phase transition bottlenecks."
+
+    # Download DAPO-Math-17k if not present
+    if [ ! -f "data/dapo-math-17k.parquet" ]; then
+        echo ""
+        echo "--- Download DAPO-Math-17k ---"
+        mkdir -p data
+        echo "[Phase2] Downloading DAPO-Math-17k..."
+        wget -q --show-progress -O data/dapo-math-17k.parquet \
+            "https://hf-mirror.com//datasets/BytedTsinghua-SIA/DAPO-Math-17k/resolve/main/data/dapo-math-17k.parquet?download=true" \
+            || { echo "[Phase2] ERROR: Failed to download DAPO-Math-17k"; exit 1; }
+        echo "[Phase2] OK: data/dapo-math-17k.parquet"
+    else
+        echo "[Phase2] DAPO-Math-17k already present."
+    fi
+
+    # Download AIME-2024 validation set if not present
+    if [ ! -f "data/aime-2024.parquet" ]; then
+        echo "[Phase2] Downloading AIME-2024..."
+        wget -q --show-progress -O data/aime-2024.parquet \
+            "https://hf-mirror.com//datasets/BytedTsinghua-SIA/AIME-2024/resolve/main/data/aime-2024.parquet?download=true" \
+            || echo "[Phase2] WARNING: Failed to download AIME-2024 (validation will be skipped)"
+        echo "[Phase2] OK: data/aime-2024.parquet"
+    fi
+
+    # GRPO training
     echo ""
-    echo "[Phase 2] Skipped."
+    echo "--- 05 GRPO Train (veRL) ---"
+    $PYTHON script/05_grpo_train.py \
+        --model "$MODEL" \
+        --rollout-n 8 \
+        --train-batch-size 32 \
+        --num-epochs 3 \
+        --log-file "result/05_verl_training.log"
+    echo "  OK: result/05_grpo_train.json"
+
+    # Compile Phase 2 metrics
+    echo ""
+    echo "--- 07 Phase 2 Metrics ---"
+    $PYTHON script/07_phase2_metrics.py
+    echo "  OK: result/07_phase2_metrics.json"
+    echo "  OK: PHASE_2_SUMMARY.md"
+
+    echo ""
+    echo "[Phase 2] Complete. Results in ./result/ and PHASE_2_SUMMARY.md"
 }
 
 # ===================================================================
@@ -253,5 +298,5 @@ echo ""
 echo "============================================"
 echo " Benchmark pipeline complete!"
 echo " Results: ./result/"
-echo " Report:  ./PHASE_1_SUMMARY.md"
+echo " Reports: ./PHASE_1_SUMMARY.md, ./PHASE_2_SUMMARY.md"
 echo "============================================"
