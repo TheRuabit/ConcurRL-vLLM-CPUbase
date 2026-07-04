@@ -47,24 +47,28 @@ parser.add_argument("--val-path", default=None,
                     help="Path to validation parquet (default: data/aime-2024.parquet)")
 parser.add_argument("--output", default=None,
                     help="Output JSON path")
-parser.add_argument("--rollout-n", type=int, default=8,
+parser.add_argument("--rollout-n", type=int, default=4,
                     help="Number of responses per prompt (GRPO group size)")
-parser.add_argument("--train-batch-size", type=int, default=32,
-                    help="Prompts per training step")
-parser.add_argument("--ppo-mini-batch-size", type=int, default=None,
-                    help="PPO mini-batch size (default: same as train-batch-size)")
-parser.add_argument("--max-prompt-length", type=int, default=2048,
-                    help="Max prompt token length")
-parser.add_argument("--max-response-length", type=int, default=4096,
-                    help="Max response token length")
+parser.add_argument("--train-batch-size", type=int, default=8,
+                    help="Prompts per training step (reduced for 2-GPU)")
+parser.add_argument("--ppo-mini-batch-size", type=int, default=2,
+                    help="PPO mini-batch size (reduced for 2-GPU memory)")
+parser.add_argument("--max-prompt-length", type=int, default=1024,
+                    help="Max prompt token length (reduced for 2-GPU memory)")
+parser.add_argument("--max-response-length", type=int, default=1024,
+                    help="Max response token length (reduced for 2-GPU memory)")
 parser.add_argument("--actor-lr", type=float, default=1e-6,
                     help="Actor learning rate")
 parser.add_argument("--num-epochs", type=int, default=3,
                     help="Number of training epochs")
 parser.add_argument("--rollout-tp", type=int, default=2,
                     help="Tensor parallel size for vLLM rollout")
-parser.add_argument("--rollout-gpu-mem-util", type=float, default=0.65,
-                    help="GPU memory utilization for vLLM rollout")
+parser.add_argument("--rollout-gpu-mem-util", type=float, default=0.50,
+                    help="GPU memory utilization for vLLM rollout (reduced for 2-GPU colocated FSDP+vLLM)")
+parser.add_argument("--enforce-eager", action="store_true", default=True,
+                    help="Disable CUDA graphs in vLLM to save GPU memory (default: True for 2-GPU)")
+parser.add_argument("--no-enforce-eager", action="store_false", dest="enforce_eager",
+                    help="Allow CUDA graphs in vLLM (may cause OOM on 2 GPUs)")
 parser.add_argument("--kl-loss-coef", type=float, default=0.001,
                     help="KL loss coefficient")
 parser.add_argument("--reward-func", default=None,
@@ -97,7 +101,7 @@ if args.reward_func is None:
 
 # Default ppo_mini_batch_size = train_batch_size
 if args.ppo_mini_batch_size is None:
-    args.ppo_mini_batch_size = args.train_batch_size
+    args.ppo_mini_batch_size = 4
 
 
 def build_hydra_overrides() -> list[str]:
@@ -109,8 +113,8 @@ def build_hydra_overrides() -> list[str]:
         f"data.train_batch_size={args.train_batch_size}",
         f"data.max_prompt_length={args.max_prompt_length}",
         f"data.max_response_length={args.max_response_length}",
-        "data.filter_overlong_prompts=True",
-        "data.truncation=error",
+        "data.filter_overlong_prompts=False",
+        "data.truncation=longest",
 
         # Model
         f"actor_rollout_ref.model.path={args.model}",
@@ -126,7 +130,7 @@ def build_hydra_overrides() -> list[str]:
         f"actor_rollout_ref.actor.optim.lr={args.actor_lr}",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={args.ppo_mini_batch_size}",
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096",
         "actor_rollout_ref.actor.use_kl_loss=True",
         f"actor_rollout_ref.actor.kl_loss_coef={args.kl_loss_coef}",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
@@ -138,13 +142,15 @@ def build_hydra_overrides() -> list[str]:
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={args.rollout_tp}",
         f"actor_rollout_ref.rollout.gpu_memory_utilization={args.rollout_gpu_mem_util}",
+        f"actor_rollout_ref.rollout.enforce_eager={str(args.enforce_eager).lower()}",
         f"actor_rollout_ref.rollout.n={args.rollout_n}",
+        f"actor_rollout_ref.rollout.max_model_len={args.max_prompt_length + args.max_response_length}",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
-        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=32768",
+        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096",
 
         # Reference policy
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True",
-        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=32768",
+        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096",
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
 
         # Reward

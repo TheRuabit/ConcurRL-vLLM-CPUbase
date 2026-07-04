@@ -109,10 +109,10 @@ Key flags: `--tensor-parallel-size 2`, `--max-model-len 51200`, `--enable-chunke
 
 ```bash
 python script/03_concurrency_driver.py --url http://localhost:8000
-python script/03_concurrency_driver.py --url http://localhost:8000 --scenarios 32 128 256
+python script/03_concurrency_driver.py --url http://localhost:8000 --scenarios 32 64 128 256
 ```
 
-Default sweep: [32, 128, 256, 512, 1024] concurrent requests, 32k input / 64 output tokens, 3 batches.
+Default sweep: [32, 64, 128, 256, 512, 1024] concurrent requests, 32k input / 64 output tokens, 3 batches.
 
 Output: `result/03_concurrency_driver.json`
 

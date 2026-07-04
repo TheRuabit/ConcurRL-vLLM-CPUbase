@@ -3,10 +3,14 @@
 Metrics Compiler & Markdown Visualizer
 =======================================
 Reads raw JSON from 03_concurrency_driver.json, computes P50/P95/P99
-aggregations across all 5 latency parameters for each concurrency tier,
+aggregations across all latency parameters for each concurrency tier,
 and generates:
   1. result/04_metrics_compiler.json — structured analytics
   2. PHASE_1_SUMMARY.md — scannable benchmark table
+
+CPU/GPU timing decomposition:
+  CPU-side: serialize + semaphore_wait + HTTP_connect
+  GPU-side: prefill + decode
 
 Usage:
     python script/04_metrics_compiler.py
@@ -109,7 +113,6 @@ def main():
 
     print(f"[04_compiler] Model:  {model}")
     print(f"[04_compiler] Traces: {len(raw_traces)}")
-
     # Group by concurrency level
     grouped: dict[int, list[dict]] = {}
     for t in raw_traces:
@@ -121,6 +124,15 @@ def main():
     # Compute per-tier statistics
     metric_keys = [
         "t_serialize_ms",
+        "t_sem_wait_ms",
+        "t_http_connect_ms",
+        "t_http_conn_queued_ms",
+        "t_http_dns_ms",
+        "t_http_tcp_connect_ms",
+        "t_http_request_send_ms",
+        "t_http_response_headers_wait_ms",
+        "t_response_header_to_first_sse_byte_ms",
+        "t_first_sse_byte_to_first_token_ms",
         "t_first_byte_ms",
         "t_server_prefill_ms",
         "t_prefill_ms",
@@ -154,30 +166,46 @@ def main():
 
         for key in metric_keys:
             values = [t[key] for t in successful if key in t]
-            tier_stats[key] = compute_full_stats(values)
+            if values:
+                tier_stats[key] = compute_full_stats(values)
 
-        # Derived: CPU vs GPU breakdown (aligned with reference decomposition)
-        #   CPU = serialize + HTTP overhead (first_byte on localhost)
-        #   GPU = pure prefill (TTFT − first_byte) + decode
-        cpu_times = [t["t_serialize_ms"] + t["t_first_byte_ms"]
-                     for t in successful]
+        # Derived CPU/GPU breakdown.
+        # CPU includes client work plus the HTTP wait before first response headers.
+        client_times = [t["t_serialize_ms"] + t.get("t_sem_wait_ms", 0)
+                        for t in successful]
+        network_queue_times = [t.get("t_http_connect_ms", t["t_first_byte_ms"] - t.get("t_sem_wait_ms", 0))
+                               for t in successful]
         gpu_times = [t["t_prefill_ms"] + t["t_decode_ms"]
                      for t in successful]
-        total_times = [c + g for c, g in zip(cpu_times, gpu_times)]
+        total_times = [c + n + g for c, n, g in zip(client_times, network_queue_times, gpu_times)]
 
-        tier_stats["cpu_time_ms"] = compute_full_stats(cpu_times)
+        tier_stats["client_time_ms"] = compute_full_stats(client_times)
+        tier_stats["network_queue_time_ms"] = compute_full_stats(network_queue_times)
         tier_stats["gpu_time_ms"] = compute_full_stats(gpu_times)
         tier_stats["total_time_ms"] = compute_full_stats(total_times)
 
+        # Backward compat: cpu_time = client + network_queue
+        cpu_times = [c + n for c, n in zip(client_times, network_queue_times)]
+        tier_stats["cpu_time_ms"] = compute_full_stats(cpu_times)
+
         # Percentages from mean
-        cpu_mean = tier_stats["cpu_time_ms"]["mean"]
+        client_mean = tier_stats["client_time_ms"]["mean"]
+        nq_mean = tier_stats["network_queue_time_ms"]["mean"]
         gpu_mean = tier_stats["gpu_time_ms"]["mean"]
         total_mean = tier_stats["total_time_ms"]["mean"]
-        tier_stats["cpu_percent"] = round(
-            (cpu_mean / total_mean * 100) if total_mean > 0 else 0, 2
+        tier_stats["client_percent"] = round(
+            (client_mean / total_mean * 100) if total_mean > 0 else 0, 2
+        )
+        tier_stats["network_queue_percent"] = round(
+            (nq_mean / total_mean * 100) if total_mean > 0 else 0, 2
         )
         tier_stats["gpu_percent"] = round(
             (gpu_mean / total_mean * 100) if total_mean > 0 else 0, 2
+        )
+        # Backward compat
+        cpu_mean = tier_stats["cpu_time_ms"]["mean"]
+        tier_stats["cpu_percent"] = round(
+            (cpu_mean / total_mean * 100) if total_mean > 0 else 0, 2
         )
 
         compiled_tiers[str(level)] = tier_stats
@@ -209,72 +237,8 @@ def main():
     lines.append(f"**Batches:** {num_batches}  ")
     lines.append(f"**Total Traces:** {len(raw_traces)}\n")
 
-    # Main latency table (P95)
-    lines.append("## Latency Breakdown (P95, ms)\n")
-    lines.append("| Concurrency | Client Serialization ($P_{95}$) | "
-                 "HTTP Overhead ($P_{95}$) | TTFT ($P_{95}$) | "
-                 "GPU Prefill ($P_{95}$) | GPU Decode ($P_{95}$) | "
-                 "Response Parsing ($P_{95}$) | Status / Degradation Source |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-
-    for level in scenarios:
-        tier = compiled_tiers.get(str(level), {})
-        if not tier or tier.get("successful", 0) == 0:
-            lines.append(f"| **{level}** | — | — | — | — | — | — | Failed |")
-            continue
-
-        s = tier
-        ser = f"{s['t_serialize_ms']['p95']:.1f}ms"
-        fb = f"{s['t_first_byte_ms']['p95']:.1f}ms"
-        ttft = f"{s['t_server_prefill_ms']['p95']:.1f}ms"
-        pre = f"{s['t_prefill_ms']['p95']:.1f}ms"
-        dec = f"{s['t_decode_ms']['p95']:.1f}ms"
-        par = f"{s['t_response_parse_ms']['p95']:.1f}ms"
-
-        e2e_p95 = s['t_e2e_ms']['p95']
-        if e2e_p95 < 500:
-            status = "Nominal execution"
-        elif e2e_p95 < 2000:
-            status = "Initial Queue Contention"
-        elif e2e_p95 < 5000:
-            status = "Context-Switch Thrashing"
-        else:
-            status = "Server Breakdown"
-
-        lines.append(f"| **{level}** | {ser} | {fb} | {ttft} | {pre} | {dec} | {par} | {status} |")
-
-    # Detailed stats table (mean/P50/P95/P99)
-    lines.append("\n## Detailed Statistics (ms)\n")
-    lines.append("| Concurrency | Metric | Mean | P50 | P95 | P99 | Min | Max |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-
-    metric_labels = {
-        "t_serialize_ms": "Client Serialization",
-        "t_first_byte_ms": "HTTP Overhead",
-        "t_server_prefill_ms": "TTFT",
-        "t_prefill_ms": "GPU Prefill",
-        "t_decode_ms": "GPU Decode",
-        "t_response_parse_ms": "Response Parsing",
-        "t_e2e_ms": "End-to-End",
-    }
-
-    for level in scenarios:
-        tier = compiled_tiers.get(str(level), {})
-        if not tier or tier.get("successful", 0) == 0:
-            continue
-        for key, label in metric_labels.items():
-            st = tier.get(key, {})
-            if not st:
-                continue
-            lines.append(
-                f"| **{level}** | {label} | "
-                f"{st['mean']:.2f} | {st['p50']:.2f} | "
-                f"{st['p95']:.2f} | {st['p99']:.2f} | "
-                f"{st['min']:.2f} | {st['max']:.2f} |"
-            )
-
-    # CPU vs GPU breakdown
-    lines.append("\n## CPU vs GPU Time Breakdown\n")
+    # CPU vs GPU breakdown first.
+    lines.append("## CPU vs GPU Time Breakdown\n")
     lines.append("| Concurrency | CPU Time (mean) | GPU Time (mean) | "
                  "Total (mean) | CPU% | GPU% |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
@@ -295,6 +259,103 @@ def main():
             f"{tier.get('gpu_percent', 0):.1f}% |"
         )
 
+    # Main latency table (P95)
+    lines.append("\n## Latency Breakdown (P95, ms)\n")
+    lines.append("| Concurrency | Serialize ($P_{95}$) | "
+                 "SemWait ($P_{95}$) | HTTP ($P_{95}$) | "
+                 "TTFT ($P_{95}$) | Prefill ($P_{95}$) | Decode ($P_{95}$) | "
+                 "E2E ($P_{95}$) | Status |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+
+    for level in scenarios:
+        tier = compiled_tiers.get(str(level), {})
+        if not tier or tier.get("successful", 0) == 0:
+            lines.append(f"| **{level}** | — | — | — | — | — | — | — | Failed |")
+            continue
+
+        s = tier
+        ser = f"{s.get('t_serialize_ms', {}).get('p95', 0):.1f}"
+        sem = f"{s.get('t_sem_wait_ms', {}).get('p95', 0):.1f}"
+        http = f"{s.get('t_http_connect_ms', {}).get('p95', 0):.1f}"
+        ttft = f"{s.get('t_server_prefill_ms', {}).get('p95', 0):.1f}"
+        pre = f"{s.get('t_prefill_ms', {}).get('p95', 0):.1f}"
+        dec = f"{s.get('t_decode_ms', {}).get('p95', 0):.1f}"
+        e2e = f"{s.get('t_e2e_ms', {}).get('p95', 0):.1f}"
+
+        e2e_p95 = s.get('t_e2e_ms', {}).get('p95', 0)
+        if e2e_p95 < 500:
+            status = "Nominal"
+        elif e2e_p95 < 2000:
+            status = "Queue Contention"
+        elif e2e_p95 < 5000:
+            status = "Thrashing"
+        else:
+            status = "Breakdown"
+
+        lines.append(f"| **{level}** | {ser} | {sem} | {http} | {ttft} | {pre} | {dec} | {e2e} | {status} |")
+
+    # Detailed stats table (mean/P50/P95/P99)
+    lines.append("\n## Detailed Statistics (ms)\n")
+    lines.append("| Concurrency | Metric | Mean | P50 | P95 | P99 | Min | Max |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+
+    metric_labels = {
+        "t_serialize_ms": "Client Serialization",
+        "t_sem_wait_ms": "Semaphore Wait (Client Gate)",
+        "t_http_connect_ms": "HTTP Connect (Queue+Net)",
+        "t_http_conn_queued_ms": "HTTP Connector Pool Wait",
+        "t_http_dns_ms": "HTTP DNS Lookup",
+        "t_http_tcp_connect_ms": "HTTP TCP Connect",
+        "t_http_request_send_ms": "HTTP Request Send",
+        "t_http_response_headers_wait_ms": "HTTP Response Headers Wait",
+        "t_response_header_to_first_sse_byte_ms": "Headers to First SSE Byte",
+        "t_first_sse_byte_to_first_token_ms": "First SSE Byte to First Token",
+        "t_first_byte_ms": "Total First Byte (Sem+HTTP)",
+        "t_server_prefill_ms": "TTFT (Server Prefill)",
+        "t_prefill_ms": "GPU Prefill (TTFT - 1stByte)",
+        "t_decode_ms": "GPU Decode",
+        "t_response_parse_ms": "Response Parsing",
+        "t_e2e_ms": "End-to-End",
+    }
+
+    for level in scenarios:
+        tier = compiled_tiers.get(str(level), {})
+        if not tier or tier.get("successful", 0) == 0:
+            continue
+        for key, label in metric_labels.items():
+            st = tier.get(key, {})
+            if not st:
+                continue
+            lines.append(
+                f"| **{level}** | {label} | "
+                f"{st['mean']:.2f} | {st['p50']:.2f} | "
+                f"{st['p95']:.2f} | {st['p99']:.2f} | "
+                f"{st['min']:.2f} | {st['max']:.2f} |"
+            )
+
+    # HTTP subphase breakdown
+    lines.append("\n## HTTP Subphase Breakdown (P95, ms)\n")
+    lines.append("| Concurrency | Total HTTP | Conn Pool | DNS | TCP Connect | "
+                 "Request Send | Response Headers | Headers→SSE | SSE→Token |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for level in scenarios:
+        tier = compiled_tiers.get(str(level), {})
+        if not tier or tier.get("successful", 0) == 0:
+            continue
+        def p95(key: str) -> float:
+            return tier.get(key, {}).get("p95", 0)
+        lines.append(
+            f"| **{level}** | "
+            f"{p95('t_http_connect_ms'):.1f} | "
+            f"{p95('t_http_conn_queued_ms'):.1f} | "
+            f"{p95('t_http_dns_ms'):.1f} | "
+            f"{p95('t_http_tcp_connect_ms'):.1f} | "
+            f"{p95('t_http_request_send_ms'):.1f} | "
+            f"{p95('t_http_response_headers_wait_ms'):.1f} | "
+            f"{p95('t_response_header_to_first_sse_byte_ms'):.1f} | "
+            f"{p95('t_first_sse_byte_to_first_token_ms'):.1f} |"
+        )
+
     md_content = "\n".join(lines) + "\n"
     out_md.write_text(md_content, encoding="utf-8")
     print(f"[04_compiler] Markdown saved to {out_md}")
@@ -302,31 +363,78 @@ def main():
     # -------------------------------------------------------------------
     # Console summary
     # -------------------------------------------------------------------
-    print("\n" + "=" * 130)
-    print("METRICS COMPILER — P95 Latency Summary (ms)")
-    print("=" * 130)
-    header = (f"{'Conc':>6s} {'Serialize':>10s} {'1stByte':>10s} {'TTFT':>10s} "
-              f"{'Prefill':>10s} {'Decode':>10s} {'Parse':>10s} "
-              f"{'E2E':>10s} {'CPU%':>7s} {'GPU%':>7s}")
+    print("\n" + "=" * 100)
+    print("CPU vs GPU TIME BREAKDOWN — Mean")
+    print("=" * 100)
+    header = (f"{'Conc':>6s} {'CPU':>12s} {'GPU':>12s} "
+              f"{'Total':>12s} {'CPU%':>7s} {'GPU%':>7s}")
     print(header)
-    print("-" * 130)
-
+    print("-" * 100)
     for level in scenarios:
         tier = compiled_tiers.get(str(level), {})
         if not tier or tier.get("successful", 0) == 0:
             print(f"{level:>6d} {'FAIL':>12s}")
             continue
         print(f"{level:>6d} "
-              f"{tier['t_serialize_ms']['p95']:>8.2f}ms "
-              f"{tier['t_first_byte_ms']['p95']:>8.2f}ms "
-              f"{tier['t_server_prefill_ms']['p95']:>8.2f}ms "
-              f"{tier['t_prefill_ms']['p95']:>8.2f}ms "
-              f"{tier['t_decode_ms']['p95']:>8.2f}ms "
-              f"{tier['t_response_parse_ms']['p95']:>8.2f}ms "
-              f"{tier['t_e2e_ms']['p95']:>8.2f}ms "
+              f"{tier.get('cpu_time_ms', {}).get('mean', 0):>10.2f}ms "
+              f"{tier.get('gpu_time_ms', {}).get('mean', 0):>10.2f}ms "
+              f"{tier.get('total_time_ms', {}).get('mean', 0):>10.2f}ms "
               f"{tier.get('cpu_percent', 0):>6.1f}% "
               f"{tier.get('gpu_percent', 0):>6.1f}%")
-    print("=" * 130)
+    print("=" * 100)
+
+    print("\n" + "=" * 150)
+    print("METRICS COMPILER — P95 Latency Summary (ms)")
+    print("=" * 150)
+    header = (f"{'Conc':>6s} {'Ser':>8s} {'SemWait':>8s} {'HTTP':>8s} "
+              f"{'1stByte':>8s} {'TTFT':>8s} {'Prefill':>8s} {'Decode':>8s} "
+              f"{'E2E':>8s} {'CPU%':>5s} {'GPU%':>5s}")
+    print(header)
+    print("-" * 150)
+
+    for level in scenarios:
+        tier = compiled_tiers.get(str(level), {})
+        if not tier or tier.get("successful", 0) == 0:
+            print(f"{level:>6d} {'FAIL':>8s}")
+            continue
+        print(f"{level:>6d} "
+              f"{tier.get('t_serialize_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_sem_wait_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_http_connect_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_first_byte_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_server_prefill_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_prefill_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_decode_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('t_e2e_ms', {}).get('p95', 0):>6.2f}ms "
+              f"{tier.get('cpu_percent', 0):>4.1f}% "
+              f"{tier.get('gpu_percent', 0):>4.1f}%")
+    print("=" * 150)
+
+    print("\n" + "=" * 150)
+    print("HTTP SUBPHASE BREAKDOWN — P95 (ms)")
+    print("=" * 150)
+    header = (f"{'Conc':>6s} {'HTTP':>9s} {'ConnQ':>9s} {'DNS':>9s} "
+              f"{'TCP':>9s} {'Send':>9s} {'RespHdr':>9s} "
+              f"{'Hdr→SSE':>9s} {'SSE→Tok':>9s}")
+    print(header)
+    print("-" * 150)
+    for level in scenarios:
+        tier = compiled_tiers.get(str(level), {})
+        if not tier or tier.get("successful", 0) == 0:
+            print(f"{level:>6d} {'FAIL':>9s}")
+            continue
+        def p95(key: str) -> float:
+            return tier.get(key, {}).get("p95", 0)
+        print(f"{level:>6d} "
+              f"{p95('t_http_connect_ms'):>7.2f}ms "
+              f"{p95('t_http_conn_queued_ms'):>7.2f}ms "
+              f"{p95('t_http_dns_ms'):>7.2f}ms "
+              f"{p95('t_http_tcp_connect_ms'):>7.2f}ms "
+              f"{p95('t_http_request_send_ms'):>7.2f}ms "
+              f"{p95('t_http_response_headers_wait_ms'):>7.2f}ms "
+              f"{p95('t_response_header_to_first_sse_byte_ms'):>7.2f}ms "
+              f"{p95('t_first_sse_byte_to_first_token_ms'):>7.2f}ms")
+    print("=" * 150)
 
 
 if __name__ == "__main__":
