@@ -429,6 +429,26 @@ class JaegerTraceFetcher:
             return []
 
     @staticmethod
+    def _is_llm_request_span(span: dict) -> bool:
+        return "request" in span.get("operationName", "").lower()
+
+    @classmethod
+    def filter_llm_request_spans(
+        cls,
+        spans: list[dict],
+        start_us: int,
+        end_us: int,
+    ) -> list[dict]:
+        result = []
+        for span in spans:
+            if not cls._is_llm_request_span(span):
+                continue
+            span_start = int(span.get("startTime", 0) or 0)
+            if start_us <= span_start <= end_us:
+                result.append(span)
+        return result
+
+    @staticmethod
     def extract_span_durations(spans: list[dict], span_name_contains: str) -> list[float]:
         """Extract durations (in seconds) for spans whose operationName matches."""
         durations = []
@@ -484,6 +504,59 @@ class JaegerTraceFetcher:
             result.setdefault("e2e", []).append(span_total)
 
         return result
+
+    @staticmethod
+    def extract_llm_request_timeline(
+        spans: list[dict],
+        scenario_start_us: int,
+    ) -> dict[str, dict]:
+        """Summarize server-side llm_request span timestamps.
+
+        All returned values are in seconds. Offsets are relative to the scenario
+        measurement start so they can be compared across concurrency levels.
+        """
+        starts = []
+        ends = []
+        durations = []
+        first_token_offsets = []
+        inference_end_offsets = []
+
+        for span in spans:
+            start_us = int(span.get("startTime", 0) or 0)
+            duration_us = int(span.get("duration", 0) or 0)
+            if start_us <= 0 or duration_us <= 0:
+                continue
+
+            start_s = (start_us - scenario_start_us) / 1e6
+            duration_s = duration_us / 1e6
+            end_s = start_s + duration_s
+            starts.append(start_s)
+            ends.append(end_s)
+            durations.append(duration_s)
+
+            tags = {t["key"]: t.get("value", 0) for t in span.get("tags", [])}
+            ttft = tags.get("gen_ai.latency.time_to_first_token", 0)
+            inference = tags.get("gen_ai.latency.time_in_model_inference", 0)
+            try:
+                ttft = float(ttft)
+            except (TypeError, ValueError):
+                ttft = 0
+            try:
+                inference = float(inference)
+            except (TypeError, ValueError):
+                inference = 0
+            if ttft > 0:
+                first_token_offsets.append(start_s + ttft)
+            if inference > 0:
+                inference_end_offsets.append(start_s + inference)
+
+        return {
+            "server_span_start_offset": JaegerTraceFetcher.compute_percentiles(starts),
+            "server_span_first_token_offset": JaegerTraceFetcher.compute_percentiles(first_token_offsets),
+            "server_span_inference_end_offset": JaegerTraceFetcher.compute_percentiles(inference_end_offsets),
+            "server_span_end_offset": JaegerTraceFetcher.compute_percentiles(ends),
+            "server_span_duration": JaegerTraceFetcher.compute_percentiles(durations),
+        }
 
     @staticmethod
     def compute_percentiles(values: list[float]) -> dict:
@@ -907,6 +980,10 @@ async def main():
         if args.connector_limit_per_host is not None:
             connector_kwargs["limit_per_host"] = args.connector_limit_per_host
         connector = aiohttp.TCPConnector(**connector_kwargs)
+    else:
+        # Default: unlimited connections to avoid aiohttp's 100-connection cap
+        # bottlenecking high-concurrency sweeps (256+).
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
 
     async with aiohttp.ClientSession(
         connector=connector,
@@ -950,6 +1027,7 @@ async def main():
             # Measurement — with continuous gauge polling
             scenario_traces: list[RequestTrace] = []
             poller = MetricsPoller(url, args.poll_interval) if args.poll_interval > 0 else None
+            scenario_start_us = int(time.time() * 1e6)
             if poller:
                 poller.start()
             for b in range(args.num_batches):
@@ -963,6 +1041,7 @@ async def main():
             poll_samples = []
             if poller:
                 poll_samples = await poller.stop()
+            scenario_end_us = int(time.time() * 1e6)
 
             # Scrape vLLM metrics after this concurrency level
             post_metrics = await scrape_vllm_metrics(scraper, session)
@@ -981,17 +1060,29 @@ async def main():
 
             # Fetch OTel spans from Jaeger for this scenario
             if jaeger_ok:
-                now_us = int(time.time() * 1e6)
-                # Look back to cover the scenario duration + buffer
-                scenario_start_us = now_us - int(180 * 1e6)
-                spans = await jaeger.fetch_spans(session, scenario_start_us, now_us)
+                # Fetch with a small buffer, then filter by the exact measurement
+                # window to avoid mixing warmup or neighboring concurrency levels.
+                spans = await jaeger.fetch_spans(
+                    session,
+                    scenario_start_us - int(5 * 1e6),
+                    scenario_end_us + int(5 * 1e6),
+                )
                 if spans:
+                    spans = jaeger.filter_llm_request_spans(
+                        spans, scenario_start_us, scenario_end_us
+                    )
                     # Extract gen_ai.latency tags from llm_request spans
                     latencies = jaeger.extract_gen_ai_latencies(spans)
                     for tag_name, values in latencies.items():
                         # Sanitize key: gen_ai.latency.time_in_queue -> otel_time_in_queue
                         key = "otel_" + tag_name.replace("gen_ai.latency.", "").replace(".", "_")
                         vllm_delta[key] = jaeger.compute_percentiles(values)
+                    vllm_delta.update(
+                        jaeger.extract_llm_request_timeline(spans, scenario_start_us)
+                    )
+                    vllm_delta["otel_llm_request_span_count"] = len(spans)
+                    vllm_delta["scenario_start_unix_us"] = scenario_start_us
+                    vllm_delta["scenario_end_unix_us"] = scenario_end_us
 
                     # Collect unique span operation names for discovery
                     span_ops = set()

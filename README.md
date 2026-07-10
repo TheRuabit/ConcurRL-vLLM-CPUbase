@@ -144,9 +144,11 @@ ConcurRL-vLLM-CPUbase/
 │   ├── 02_launch_vllm.py           # vLLM server launcher (supports --detach)
 │   ├── 03_concurrency_driver.py    # Async burst profiler (32 → 1024)
 │   ├── 04_metrics_compiler.py      # JSON aggregator + Markdown report
-│   ├── 05_grpo_train.py            # Phase 2: GRPO training via veRL
+│   ├── 05_grpo_instrumented.py     # Phase 2: instrumented GRPO training via veRL
+│   ├── 05c_phase2_sweep.py         # Phase 2: multi-config concurrency sweep
 │   ├── 06_math_reward.py           # Phase 2: math reward function with timing
-│   └── 07_phase2_metrics.py        # Phase 2: timing compiler
+│   ├── 07b_phase2_rollout_metrics.py  # Phase 2: rollout metrics compiler
+│   └── phase2_instrument.py        # Phase 2: monkey-patch instrumentation module
 │
 ├── data/                           # Datasets (auto-downloaded)
 │   ├── dapo-math-17k.parquet
@@ -168,6 +170,7 @@ All scripts support `--help`.
 | `02_launch_vllm.py`        | `--model`, `--port`, `--tensor-parallel-size`, `--max-model-len`, `--detach`, `--pid-file`, `--wait-only` | Qwen3-30B-A3B, port 8000, TP=2        |
 | `03_concurrency_driver.py` | `--url`, `--scenarios`, `--num-batches`, `--input-tokens`, `--output-tokens`                              | localhost:8000, [32..1024], 3 batches |
 | `04_metrics_compiler.py`   | `--input`, `--output-json`, `--output-md`                                                                 | Reads from `result/03_*.json`         |
-| `05_grpo_train.py`         | `--model`, `--rollout-n`, `--train-batch-size`, `--num-epochs`, `--reward-func`                           | rollout_n=8, batch=32, epochs=3       |
-| `07_phase2_metrics.py`     | `--input`, `--output-json`, `--output-md`                                                                 | Reads from `result/05_*.json`         |
+| `05_grpo_instrumented.py`  | `--model`, `--rollout-n`, `--train-batch-size`, `--num-epochs`, `--enable-otel`, `--jaeger-url`           | rollout_n=8, batch=32, epochs=3       |
+| `05c_phase2_sweep.py`      | `--model`, `--data-path`, `--configs`, `--enable-otel`, `--jaeger-url`                                    | 5 configs from (2,4) to (4,32)        |
+| `07b_phase2_rollout_metrics.py` | `--input`, `--output-json`, `--output-md`                                                            | Reads from `result/05_*.json`         |
 | `run_all.sh`               | `--phase`, `--model`, `--url`, `--max_output_token`, `--keep-vllm`                                        | phase=all, Qwen3-30B-A3B              |

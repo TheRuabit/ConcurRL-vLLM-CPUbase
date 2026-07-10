@@ -7,6 +7,9 @@ __pycache__/
 result/
 .claude/
 .mimocode/
+.tex/
+tex/
+
 
 # Unrelevant file
 PLAN.md

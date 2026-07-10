@@ -55,6 +55,8 @@ parser.add_argument("--max-num-seqs", type=int, default=1024,
 parser.add_argument("--max-num-batched-tokens", type=int, default=None,
                     help="Max tokens per batch (default: 8192 for chunked prefill). "
                          "Increase to reduce scheduling rounds for long inputs")
+parser.add_argument("--disable-prefix-caching", action="store_true",
+                    help="Pass --no-enable-prefix-caching to vLLM")
 parser.add_argument("--scheduling-policy", default=None,
                     choices=["fcfs", "priority"],
                     help="Scheduling policy (default: fcfs)")
@@ -144,6 +146,8 @@ def main():
         cmd.append("--enable-chunked-prefill")
     if args.max_num_batched_tokens is not None:
         cmd.extend(["--max-num-batched-tokens", str(args.max_num_batched_tokens)])
+    if args.disable_prefix_caching:
+        cmd.append("--no-enable-prefix-caching")
     if args.scheduling_policy is not None:
         cmd.extend(["--scheduling-policy", args.scheduling_policy])
 
@@ -173,6 +177,7 @@ def main():
             stdout=log_handle if log_handle else sys.stdout,
             stderr=subprocess.STDOUT if log_handle else sys.stderr,
             text=True,
+            start_new_session=args.detach,
         )
 
         # Wait for health in a background thread while process runs
