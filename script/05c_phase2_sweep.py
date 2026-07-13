@@ -70,6 +70,14 @@ parser.add_argument("--ppo-mini-batch-size", type=int, default=1,
                     help="PPO mini-batch size")
 parser.add_argument("--skip-venv", action="store_true", default=False,
                     help="Skip venv activation")
+parser.add_argument("--rollout-only", action="store_true", default=False,
+                    help="Run grouped veRL rollout only; skip all GRPO update stages")
+parser.add_argument("--warmup-steps", type=int, default=1,
+                    help="Warmup rollout steps excluded from metrics")
+parser.add_argument("--measured-steps", type=int, default=2,
+                    help="Measured rollout steps per configuration")
+parser.add_argument("--disable-rollout-trace", action="store_true", default=False,
+                    help="Disable request-correlated Python instrumentation")
 args = parser.parse_args()
 
 if args.data_path is None:
@@ -125,6 +133,14 @@ def run_config(rollout_n: int, train_bs: int) -> dict:
         cmd.extend(["--enable-otel", "--otlp-endpoint", args.otlp_endpoint])
 
     cmd.extend(["--jaeger-url", args.jaeger_url])
+    if args.rollout_only:
+        cmd.extend([
+            "--rollout-only",
+            "--warmup-steps", str(args.warmup_steps),
+            "--measured-steps", str(args.measured_steps),
+        ])
+    if args.disable_rollout_trace:
+        cmd.append("--disable-rollout-trace")
 
     print(f"\n{'='*70}")
     print(f"  Config: concurrency={concurrency}  rollout_n={rollout_n}  batch={train_bs}")
@@ -155,8 +171,47 @@ def run_config(rollout_n: int, train_bs: int) -> dict:
         summary = {}
         if output_file.exists():
             data = json.loads(output_file.read_text())
+            rollout_only = data.get("rollout_only_metrics")
+            if rollout_only:
+                stages = rollout_only.get("request_stages", {})
+                summary = {
+                    "num_steps": args.measured_steps,
+                    "group_ready_p95_ms": rollout_only.get(
+                        "group_ready_latency", {}
+                    ).get("p95_ms"),
+                    "request_first_output_p95_ms": rollout_only.get(
+                        "request_tail_latency", {}
+                    ).get("p95_ms"),
+                    "prompt_preparation_p95_ms": stages.get(
+                        "prompt_preparation", {}
+                    ).get("p95_ms"),
+                    "request_admission_p95_ms": stages.get(
+                        "request_admission", {}
+                    ).get("p95_ms"),
+                    "scheduler_wait_p95_ms": stages.get(
+                        "scheduler_wait", {}
+                    ).get("p95_ms"),
+                    "first_scheduled_to_output_p95_ms": stages.get(
+                        "first_scheduled_to_output", {}
+                    ).get("p95_ms"),
+                    "output_token_throughput": rollout_only.get(
+                        "throughput", {}
+                    ).get("output_tokens_per_s"),
+                    "completed_group_throughput": rollout_only.get(
+                        "throughput", {}
+                    ).get("completed_groups_per_s"),
+                    "kv_allocation_failures": rollout_only.get(
+                        "kv_allocation", {}
+                    ).get("failure_attempts", 0),
+                    "preemption_events": rollout_only.get(
+                        "preemption", {}
+                    ).get("events", 0),
+                    "terminal_request_failures": rollout_only.get(
+                        "terminal_request_failures", 0
+                    ),
+                }
             rollout_steps = data.get("rollout_steps", [])
-            if rollout_steps:
+            if rollout_steps and not rollout_only:
                 # Aggregate across steps
                 all_p95_group = [s["group_completion_p95_ms"] for s in rollout_steps]
                 all_throughput = [s["output_token_throughput"] for s in rollout_steps]
@@ -195,10 +250,15 @@ def run_config(rollout_n: int, train_bs: int) -> dict:
 
         print(f"  SUCCESS: {elapsed:.0f}s")
         if summary:
-            print(f"    Steps: {summary.get('num_steps', '?')}, "
-                  f"Rollout: {summary.get('mean_rollout_ms', '?'):.0f}ms, "
-                  f"P95 group: {summary.get('mean_group_completion_p95_ms', '?'):.0f}ms, "
-                  f"Tok/s: {summary.get('mean_output_token_throughput', '?'):.0f}")
+            if args.rollout_only:
+                print(f"    Steps: {summary.get('num_steps', '?')}, "
+                      f"Group ready P95: {summary.get('group_ready_p95_ms')}ms, "
+                      f"Tok/s: {summary.get('output_token_throughput')}")
+            else:
+                print(f"    Steps: {summary.get('num_steps', '?')}, "
+                      f"Rollout: {summary.get('mean_rollout_ms', '?'):.0f}ms, "
+                      f"P95 group: {summary.get('mean_group_completion_p95_ms', '?'):.0f}ms, "
+                      f"Tok/s: {summary.get('mean_output_token_throughput', '?'):.0f}")
 
         return {
             "status": "success",
@@ -219,6 +279,8 @@ def main():
     print(f"[05c_sweep] Configs:   {[(r, b) for r, b in configs]}")
     print(f"[05c_sweep] Epochs:    {args.num_epochs}")
     print(f"[05c_sweep] OTel:      {'enabled' if args.enable_otel else 'disabled'}")
+    print(f"[05c_sweep] Mode:      "
+          f"{'verl_group_rollout_only' if args.rollout_only else 'grpo_training'}")
     print(f"[05c_sweep] Output:    {OUTDIR}")
 
     results = []
@@ -240,8 +302,8 @@ def main():
     print(f"  SWEEP SUMMARY")
     print(f"{'='*100}")
     print(f"  {'Conc':>6s} {'N':>4s} {'B':>4s} {'Status':>8s} "
-          f"{'Steps':>6s} {'Rollout':>10s} {'P95_group':>12s} {'Tok/s':>10s} "
-          f"{'P95_lat':>10s} {'Cache%':>8s}")
+          f"{'Steps':>6s} {'P95_group':>12s} {'P95_req':>10s} {'Tok/s':>10s} "
+          f"{'KVFail':>8s} {'Preempt':>8s}")
     print(f"  {'─'*6} {'─'*4} {'─'*4} {'─'*8} "
           f"{'─'*6} {'─'*10} {'─'*12} {'─'*10} "
           f"{'─'*10} {'─'*8}")
@@ -251,11 +313,11 @@ def main():
         if status == "success":
             print(f"  {c:6d} {r['rollout_n']:4d} {r['train_batch_size']:4d} {status:>8s} "
                   f"{r.get('num_steps', 0):6d} "
-                  f"{r.get('mean_rollout_ms', 0):10.0f} "
-                  f"{r.get('mean_group_completion_p95_ms', 0):12.0f} "
-                  f"{r.get('mean_output_token_throughput', 0):10.0f} "
-                  f"{r.get('mean_request_latency_p95_ms', 0):10.0f} "
-                  f"{r.get('vllm_prefix_cache_hit_rate', 0) or 0:8.2f}")
+                  f"{(r.get('group_ready_p95_ms') or r.get('mean_group_completion_p95_ms', 0)):12.0f} "
+                  f"{(r.get('request_first_output_p95_ms') or r.get('mean_request_latency_p95_ms', 0)):10.0f} "
+                  f"{(r.get('output_token_throughput') or r.get('mean_output_token_throughput', 0)):10.0f} "
+                  f"{r.get('kv_allocation_failures', 0):8d} "
+                  f"{r.get('preemption_events', 0):8d}")
         else:
             print(f"  {c:6d} {r['rollout_n']:4d} {r['train_batch_size']:4d} {status:>8s}")
 

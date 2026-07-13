@@ -89,6 +89,16 @@ parser.add_argument("--dry-run", action="store_true", default=False,
 parser.add_argument("--vllm-server-url", default=None,
                     help="External vLLM server URL (e.g. http://localhost:8000). "
                          "When set, skips launching vLLM and connects to existing server.")
+parser.add_argument("--rollout-only", action="store_true", default=False,
+                    help="Run veRL grouped rollout only; skip reward, advantage, and updates")
+parser.add_argument("--warmup-steps", type=int, default=1,
+                    help="Warmup rollout steps excluded from metrics")
+parser.add_argument("--measured-steps", type=int, default=2,
+                    help="Measured rollout steps")
+parser.add_argument("--disable-rollout-trace", action="store_true", default=False,
+                    help="Disable request-correlated Python event emission")
+parser.add_argument("--trace-file", default=None,
+                    help="Shared rollout event JSONL path")
 args = parser.parse_args()
 
 # Resolve paths
@@ -99,6 +109,11 @@ if args.output:
 else:
     out_path = project_dir / "result" / "05_grpo_instrumented.json"
 out_path.parent.mkdir(parents=True, exist_ok=True)
+trace_path = (
+    Path(args.trace_file)
+    if args.trace_file
+    else out_path.with_name(out_path.stem + "_events.jsonl")
+)
 
 if args.data_path is None:
     args.data_path = str(project_dir / "data" / "dapo-math-17k.parquet")
@@ -190,7 +205,18 @@ def build_hydra_overrides() -> list[str]:
         f"trainer.save_freq={args.save_freq}",
         f"trainer.test_freq={args.test_freq}",
         f"trainer.total_epochs={args.num_epochs}",
+        "trainer.use_v1=False",
     ]
+
+    if args.rollout_only:
+        overrides.extend([
+            "actor_rollout_ref.actor.use_kl_loss=False",
+            "trainer.val_before_train=False",
+            "trainer.save_freq=-1",
+            "trainer.test_freq=-1",
+            "+actor_rollout_ref.rollout.agent.agent_loop_manager_class="
+            "script.verl_rollout_only.InstrumentedAgentLoopManager",
+        ])
 
     # OTLP tracing for vLLM
     if args.enable_otel:
@@ -234,8 +260,8 @@ def parse_timing_from_log(log_text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Ray TaskRunner patching
 # ---------------------------------------------------------------------------
-def _patch_task_runner():
-    """Patch TaskRunner.run() to apply instrumentation in the Ray worker process.
+def _make_task_runner():
+    """Create a TaskRunner that applies instrumentation in the Ray worker.
 
     run_ppo() creates a Ray remote TaskRunner. The TaskRunner.run() method
     executes in a separate Ray worker process where the monkey-patches from
@@ -244,28 +270,41 @@ def _patch_task_runner():
     This function patches TaskRunner.run() to import and apply the
     instrumentation module before the original run() executes.
     """
-    from verl.trainer.main_ppo import TaskRunner
+    import ray
+    from verl.trainer.main_ppo_v0 import BaseTaskRunner, TaskRunner
 
-    orig_run = TaskRunner.run
+    original_runner_class = TaskRunner.__ray_metadata__.modified_class
+    original_run = original_runner_class.run
 
-    def _instrumented_run(self, config):
+    class InstrumentedTaskRunner(BaseTaskRunner):
+        def run(self, config):
         # Import and apply patches in the Ray worker process
-        project = str(project_dir)
-        if project not in sys.path:
-            sys.path.insert(0, project)
-        try:
-            import script.phase2_instrument as worker_inst
-            if args.vllm_server_url:
-                worker_inst.set_external_vllm_url(args.vllm_server_url)
-            worker_inst.apply_patches()
-            print(f"[05_instrumented] Instrumentation patches applied in TaskRunner "
-                  f"(PID={os.getpid()})")
-        except Exception as e:
-            print(f"[05_instrumented] WARNING: Failed to apply patches in TaskRunner: {e}")
+            project = str(project_dir)
+            if project not in sys.path:
+                sys.path.insert(0, project)
+            try:
+                if args.rollout_only:
+                    from script.verl_rollout_only import install_driver_patches
+                    install_driver_patches(
+                        warmup_steps=args.warmup_steps,
+                        measured_steps=args.measured_steps,
+                    )
+                    print(f"[05_instrumented] Rollout-only patches applied in TaskRunner "
+                          f"(PID={os.getpid()})")
+                else:
+                    import script.phase2_instrument as worker_inst
+                    if args.vllm_server_url:
+                        worker_inst.set_external_vllm_url(args.vllm_server_url)
+                    worker_inst.apply_patches()
+                    print(f"[05_instrumented] Instrumentation patches applied in TaskRunner "
+                          f"(PID={os.getpid()})")
+            except Exception as e:
+                print(f"[05_instrumented] WARNING: Failed to apply patches in TaskRunner: {e}")
+                raise
 
-        return orig_run(self, config)
+            return original_run(self, config)
 
-    TaskRunner.run = _instrumented_run
+    return ray.remote(InstrumentedTaskRunner)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +321,13 @@ def main():
     print(f"[05_instrumented] OTel:          {'enabled' if args.enable_otel else 'disabled'}")
     print(f"[05_instrumented] Jaeger URL:    {args.jaeger_url}")
     print(f"[05_instrumented] Output:        {out_path}")
+    print(f"[05_instrumented] Mode:          "
+          f"{'verl_group_rollout_only' if args.rollout_only else 'grpo_training'}")
+    if args.rollout_only:
+        print(f"[05_instrumented] Steps:         "
+              f"{args.warmup_steps} warmup + {args.measured_steps} measured")
+        print(f"[05_instrumented] Trace:         "
+              f"{'disabled' if args.disable_rollout_trace else trace_path}")
     print()
 
     overrides = build_hydra_overrides()
@@ -298,18 +344,33 @@ def main():
 
     # Apply patches in main process (for TaskRunner.run wrapper)
     inst.reset()
-    if args.vllm_server_url:
-        inst.set_external_vllm_url(args.vllm_server_url)
-    inst.apply_patches()
-    _patch_task_runner()
+    if args.rollout_only:
+        if trace_path.exists():
+            trace_path.unlink()
+        os.environ["CONCURL_ROLLOUT_TRACE"] = (
+            "0" if args.disable_rollout_trace else "1"
+        )
+        os.environ["CONCURL_ROLLOUT_TRACE_PATH"] = str(trace_path.resolve())
+    else:
+        if args.vllm_server_url:
+            inst.set_external_vllm_url(args.vllm_server_url)
+        inst.apply_patches()
+    task_runner_class = _make_task_runner()
 
     # Ensure Ray workers can access the project directory
     import ray
     if not ray.is_initialized():
         ray.init(runtime_env={
             "working_dir": str(project_dir),
+            "env_vars": {
+                "CONCURL_ROLLOUT_TRACE": os.environ.get("CONCURL_ROLLOUT_TRACE", "0"),
+                "CONCURL_ROLLOUT_TRACE_PATH": os.environ.get(
+                    "CONCURL_ROLLOUT_TRACE_PATH", ""
+                ),
+            },
             "excludes": [
-                ".venv/**", "venv_18/**", "result/**",
+                ".venv/**", ".venv-*/**", ".deps/**", ".tools/**",
+                "venv_18/**", "result/**",
                 ".git/**", "__pycache__/**", "*.egg-info/**",
                 "data/**", "vllm_src_018/**", "Qwen/**",
                 ".mimocode/**", "models/**", "*.parquet",
@@ -401,14 +462,14 @@ def main():
                     log_handle.buffer, encoding="utf-8", line_buffering=True
                 )
                 try:
-                    run_ppo(config)
+                    run_ppo(config, task_runner_class=task_runner_class)
                 finally:
                     sys.stdout, sys.stderr = old_stdout, old_stderr
             else:
-                run_ppo(config)
+                run_ppo(config, task_runner_class=task_runner_class)
 
         t_elapsed = time.perf_counter() - t_start
-        print(f"[05_instrumented] Training completed in {t_elapsed:.1f}s")
+        print(f"[05_instrumented] Execution completed in {t_elapsed:.1f}s")
 
     except Exception as e:
         t_elapsed = time.perf_counter() - t_start
@@ -436,9 +497,20 @@ def main():
     step_timings = parse_timing_from_log(log_text) if log_text else []
 
     # Build final output
+    rollout_only_metrics = None
+    if args.rollout_only:
+        from script.verl_rollout_only import aggregate_trace
+        rollout_only_metrics = aggregate_trace(
+            trace_path,
+            expected_group_size=args.rollout_n,
+        )
+
     output = {
         "benchmark": "phase2_grpo_instrumented",
         "status": "completed",
+        "execution_mode": (
+            "verl_group_rollout_only" if args.rollout_only else "grpo_training"
+        ),
         "model": args.model,
         "data_path": args.data_path,
         "rollout_n": args.rollout_n,
@@ -458,11 +530,35 @@ def main():
         "server_addresses": inst_data["server_addresses"],
         "num_requests_total": inst_data["num_requests"],
         "request_records": inst_data.get("request_records", []),
+        "rollout_only_metrics": rollout_only_metrics,
+        "rollout_trace_enabled": not args.disable_rollout_trace,
+        "rollout_trace_path": str(trace_path) if args.rollout_only else None,
         "verl_overrides": overrides,
     }
 
     out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
     print(f"\n[05_instrumented] Results saved to {out_path}")
+
+    if rollout_only_metrics:
+        stages = rollout_only_metrics["request_stages"]
+        print("\nveRL GROUP ROLLOUT-ONLY")
+        for name in [
+            "rollout_first_output_wait",
+            "prompt_preparation",
+            "request_admission",
+            "scheduler_wait",
+            "first_scheduled_to_output",
+        ]:
+            metric = stages.get(name, {})
+            print(f"  {name:32s} P95={metric.get('p95_ms')} ms")
+        group_p95 = rollout_only_metrics["group_ready_latency"].get("p95_ms")
+        throughput = rollout_only_metrics["throughput"]
+        print(f"  {'group_ready':32s} P95={group_p95} ms")
+        print(f"  output_tokens/s={throughput.get('output_tokens_per_s')}  "
+              f"completed_groups/s={throughput.get('completed_groups_per_s')}")
+        print(f"  KV alloc fails={rollout_only_metrics['kv_allocation']['failure_attempts']}  "
+              f"preemptions={rollout_only_metrics['preemption']['events']}  "
+              f"terminal failures={rollout_only_metrics['terminal_request_failures']}")
 
     # Print summary
     rollout_steps = inst_data["rollout_steps"]
