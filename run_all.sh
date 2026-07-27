@@ -84,10 +84,11 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: bash run_all.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --phase <test|1|2|all>  Which phase to run (default: all)"
+            echo "  --phase <test|1|2|2e|all>  Which phase to run (default: all)"
             echo "                          test  = 01_compile_check.py (mock server)"
             echo "                          1     = 02+03+04 (vLLM concurrency sweep)"
             echo "                          2     = 05+06+07 (GRPO RL loop via veRL)"
+            echo "                          2e    = 08 multi-turn tool-calling benchmark"
             echo "                          all   = all phases"
             echo "  --model <path>          Model name or path (default: Qwen/Qwen3-30B-A3B)"
             echo "  --max_output_token <N>  Max output tokens per request (default: 64)"
@@ -305,6 +306,60 @@ run_phase_2() {
 }
 
 # ===================================================================
+# Phase 2e: Multi-Turn Tool-Calling Benchmark
+# ===================================================================
+run_phase_2e() {
+    echo "==========================================="
+    echo " PHASE 2e: Multi-Turn Tool-Calling Benchmark"
+    echo "==========================================="
+
+    # Check if server is already running
+    echo "[Phase2e] Checking server at $SERVER_URL ..."
+    if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
+        echo "[Phase2e] Server already running."
+    else
+        echo ""
+        echo "--- Launch vLLM Server ---"
+        echo "[Phase2e] Starting vLLM server..."
+        VLLM_PID_FILE="result/vllm_server.pid"
+        $PYTHON script/02_launch_vllm.py \
+            --model "$MODEL" \
+            --port "${SERVER_URL##*:}" \
+            --tensor-parallel-size "$NUM_GPUS" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --health-timeout "$HEALTH_TIMEOUT" \
+            --detach \
+            --pid-file "$VLLM_PID_FILE"
+    fi
+
+    # Multi-turn tool-calling sweep
+    echo ""
+    echo "--- 08 Tool-Calling Sweep ---"
+    $PYTHON script/08b_tool_call_sweep.py \
+        --url "$SERVER_URL" \
+        --model "$MODEL" \
+        --num-batches "$NUM_BATCHES" \
+        --warmup-batches 1
+    echo "  OK: result/08_sweep/"
+
+    # Compile metrics
+    echo ""
+    echo "--- 08c Metrics Compiler ---"
+    $PYTHON script/08c_tool_call_metrics.py
+    echo "  OK: result/08c_tool_call_metrics.json"
+    echo "  OK: PHASE_2E_SUMMARY.md"
+
+    # Generate plots
+    echo ""
+    echo "--- 08d Plot Generator ---"
+    $PYTHON script/08d_tool_call_plot.py
+    echo "  OK: result/plots/08e_*.png"
+
+    echo ""
+    echo "[Phase 2e] Complete. Results in ./result/ and PHASE_2E_SUMMARY.md"
+}
+
+# ===================================================================
 # Phase 3: Analysis & Solution Design [TODO]
 # ===================================================================
 run_phase_3() {
@@ -330,6 +385,9 @@ case "$PHASE" in
     2)
         run_phase_2
         ;;
+    2e)
+        run_phase_2e
+        ;;
     3)
         run_phase_3
         ;;
@@ -342,12 +400,15 @@ case "$PHASE" in
         read -p "Press Enter to continue to Phase 2..."
         run_phase_2
         echo ""
+        read -p "Press Enter to continue to Phase 2e (multi-turn tool-calling)..."
+        run_phase_2e
+        echo ""
         read -p "Press Enter to continue to Phase 3..."
         run_phase_3
         ;;
     *)
         echo "Unknown phase: $PHASE"
-        echo "Valid options: test, 1, 2, 3, all"
+        echo "Valid options: test, 1, 2, 2e, 3, all"
         exit 1
         ;;
 esac

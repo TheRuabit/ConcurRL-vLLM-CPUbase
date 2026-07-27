@@ -1,62 +1,55 @@
 # Phase 1: Concurrency Scaling Validation — Benchmark Results
 
 **Model:** Qwen/Qwen3-30B-A3B  
-**Input Tokens:** 32,000  
+**Input Tokens:** 8,192  
 **Output Tokens:** 64  
 **Batches:** 3  
-**Total Traces:** 5856
+**Total Traces:** 1536
+
+## Timing Breakdown (Mean, Mutually Exclusive Buckets)
+
+| Concurrency | CPU Measured | Client/Network Wait | Server/Header Wait | GPU Time | Total | CPU% | Wait% | GPU% |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **512** | 0.1ms | 170.2ms | 3570.1ms | 143736.1ms | 147476.6ms | 0.0% | 2.5% | 97.5% |
 
 ## Latency Breakdown (P95, ms)
 
-| Concurrency | Client Serialization ($P_{95}$) | Server Overhead ($P_{95}$) | GPU Prefill ($P_{95}$) | GPU Decode ($P_{95}$) | Response Parsing ($P_{95}$) | Status / Degradation Source |
-| ----------- | ------------------------------- | -------------------------- | ---------------------- | --------------------- | --------------------------- | --------------------------- |
-| **32**      | 0.5ms                           | 670.2ms                    | 762.5ms                | 2026.7ms              | 2026.7ms                    | Context-Switch Thrashing    |
-| **128**     | 0.5ms                           | 4924.0ms                   | 5036.7ms               | 3738.8ms              | 3738.9ms                    | Server Breakdown            |
-| **256**     | 0.5ms                           | 9346.7ms                   | 9490.9ms               | 4023.3ms              | 4023.4ms                    | Server Breakdown            |
-| **512**     | 0.5ms                           | 18814.1ms                  | 18962.8ms              | 3939.7ms              | 3939.8ms                    | Server Breakdown            |
-| **1024**    | 0.5ms                           | 39217.9ms                  | 39314.9ms              | 4079.0ms              | 4079.1ms                    | Server Breakdown            |
+| Concurrency | Serialize ($P_{95}$) | Client/Network Wait ($P_{95}$) | Server/Header Wait ($P_{95}$) | Prefill ($P_{95}$) | Decode ($P_{95}$) | E2E ($P_{95}$) | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **512** | 0.2 | 241.0 | 6494.0 | 199544.1 | 45154.8 | 218095.9 | Breakdown |
 
 ## Detailed Statistics (ms)
 
-| Concurrency | Metric               | Mean     | P50      | P95      | P99      | Min     | Max      |
-| ----------- | -------------------- | -------- | -------- | -------- | -------- | ------- | -------- |
-| **32**      | Client Serialization | 0.44     | 0.44     | 0.45     | 0.48     | 0.44    | 0.48     |
-| **32**      | Server Overhead      | 375.27   | 391.88   | 670.23   | 679.08   | 89.72   | 679.08   |
-| **32**      | GPU Prefill (TTFT)   | 517.18   | 578.49   | 762.45   | 770.94   | 149.10  | 770.94   |
-| **32**      | GPU Decode           | 1802.36  | 1751.16  | 2026.68  | 2068.02  | 1665.53 | 2068.02  |
-| **32**      | Response Parsing     | 1802.39  | 1751.18  | 2026.71  | 2068.07  | 1665.56 | 2068.07  |
-| **32**      | End-to-End           | 2320.00  | 2321.57  | 2460.00  | 2468.84  | 1955.45 | 2468.84  |
-| **128**     | Client Serialization | 0.48     | 0.48     | 0.49     | 0.52     | 0.44    | 0.55     |
-| **128**     | Server Overhead      | 1694.85  | 1059.03  | 4923.95  | 5094.34  | 199.21  | 5163.22  |
-| **128**     | GPU Prefill (TTFT)   | 1919.91  | 1409.97  | 5036.73  | 5193.86  | 252.47  | 5253.27  |
-| **128**     | GPU Decode           | 3217.03  | 3478.63  | 3738.84  | 3963.07  | 1675.95 | 3965.11  |
-| **128**     | Response Parsing     | 3217.06  | 3478.66  | 3738.87  | 3963.10  | 1675.98 | 3965.13  |
-| **128**     | End-to-End           | 5137.43  | 4899.70  | 6851.31  | 6962.00  | 3666.12 | 6972.41  |
-| **256**     | Client Serialization | 0.48     | 0.48     | 0.49     | 0.52     | 0.44    | 1.02     |
-| **256**     | Server Overhead      | 4425.26  | 4892.89  | 9346.73  | 9567.46  | 273.61  | 9593.38  |
-| **256**     | GPU Prefill (TTFT)   | 4602.39  | 5002.57  | 9490.92  | 9682.82  | 326.87  | 9737.54  |
-| **256**     | GPU Decode           | 3570.33  | 3675.29  | 4023.34  | 4032.59  | 2567.49 | 4047.89  |
-| **256**     | Response Parsing     | 3570.36  | 3675.32  | 4023.37  | 4032.62  | 2567.52 | 4047.92  |
-| **256**     | End-to-End           | 8173.22  | 8830.99  | 12246.58 | 12379.53 | 3688.44 | 12401.22 |
-| **512**     | Client Serialization | 0.48     | 0.48     | 0.48     | 0.52     | 0.47    | 1.13     |
-| **512**     | Server Overhead      | 9763.39  | 10006.81 | 18814.10 | 20322.81 | 424.16  | 20691.23 |
-| **512**     | GPU Prefill (TTFT)   | 9941.68  | 10094.26 | 18962.79 | 20439.22 | 477.47  | 20802.89 |
-| **512**     | GPU Decode           | 3679.30  | 3747.02  | 3939.73  | 3984.26  | 1828.70 | 4018.25  |
-| **512**     | Response Parsing     | 3679.33  | 3747.05  | 3939.76  | 3984.28  | 1828.72 | 4018.28  |
-| **512**     | End-to-End           | 13621.47 | 13957.62 | 22283.74 | 22724.22 | 3576.96 | 22857.62 |
-| **1024**    | Client Serialization | 0.48     | 0.48     | 0.48     | 0.53     | 0.47    | 12.91    |
-| **1024**    | Server Overhead      | 20507.47 | 20897.24 | 39217.93 | 41396.29 | 712.18  | 42327.53 |
-| **1024**    | GPU Prefill (TTFT)   | 20671.75 | 21063.08 | 39314.89 | 41526.52 | 766.73  | 42429.04 |
-| **1024**    | GPU Decode           | 3757.30  | 3800.55  | 4079.05  | 4107.87  | 1817.14 | 4130.67  |
-| **1024**    | Response Parsing     | 3757.33  | 3800.57  | 4079.07  | 4107.90  | 1817.17 | 4130.69  |
-| **1024**    | End-to-End           | 24429.55 | 24943.11 | 42884.64 | 43939.98 | 3861.23 | 44246.69 |
+| Concurrency | Metric | Mean | P50 | P95 | P99 | Min | Max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **512** | Client Serialization | 0.15 | 0.15 | 0.16 | 0.19 | 0.12 | 1.09 |
+| **512** | Semaphore Wait (Client Gate) | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.04 |
+| **512** | HTTP Connect (Queue+Net) | 3740.25 | 3665.30 | 6653.49 | 7002.16 | 294.38 | 7228.40 |
+| **512** | HTTP Connector Pool Wait | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| **512** | HTTP DNS Lookup | 0.15 | 0.00 | 0.00 | 0.00 | 0.00 | 80.18 |
+| **512** | HTTP TCP Connect | 136.28 | 156.56 | 230.21 | 245.61 | 0.00 | 264.83 |
+| **512** | HTTP Request Send | 33.80 | 10.81 | 130.45 | 142.02 | 0.74 | 145.52 |
+| **512** | HTTP Response Headers Wait | 3570.08 | 3476.19 | 6493.98 | 6830.87 | 149.52 | 6991.91 |
+| **512** | First SSE Byte to First Token | 0.02 | 0.02 | 0.02 | 0.03 | 0.01 | 0.04 |
+| **512** | TTFT (Server Prefill) | 107462.16 | 107570.57 | 206309.91 | 214692.37 | 670.83 | 216867.77 |
+| **512** | GPU Prefill (TTFT - 1stByte) | 103721.90 | 103893.36 | 199544.12 | 207911.38 | 336.53 | 210045.55 |
+| **512** | GPU Decode | 40014.21 | 44401.53 | 45154.76 | 45952.77 | 1783.60 | 47303.12 |
+| **512** | End-to-End | 147476.54 | 152408.53 | 218095.87 | 218535.81 | 43679.14 | 218651.52 |
 
-## CPU vs GPU Time Breakdown
+## HTTP Subphase Breakdown (P95, ms)
 
-| Concurrency | CPU Time (mean) | GPU Time (mean) | Total (mean) | CPU%  | GPU%  |
-| ----------- | --------------- | --------------- | ------------ | ----- | ----- |
-| **32**      | 375.7ms         | 2319.5ms        | 2695.3ms     | 13.9% | 86.1% |
-| **128**     | 1695.3ms        | 5136.9ms        | 6832.3ms     | 24.8% | 75.2% |
-| **256**     | 4425.7ms        | 8172.7ms        | 12598.5ms    | 35.1% | 64.9% |
-| **512**     | 9763.9ms        | 13621.0ms       | 23384.8ms    | 41.8% | 58.2% |
-| **1024**    | 20508.0ms       | 24429.0ms       | 44937.0ms    | 45.6% | 54.4% |
+| Concurrency | Total HTTP | Conn Pool | DNS | TCP Connect | Request Send | Response Headers |
+| --- | --- | --- | --- | --- | --- | --- |
+| **512** | 6653.5 | 0.0 | 0.0 | 230.2 | 130.5 | 6494.0 |
+
+## Server-side OTel Breakdown (P95, ms)
+
+| Concurrency | Client RespHdr Wait | Server Queue | Server TTFT | Model Prefill | Model Decode | Server E2E | Span Count |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **512** | 6494.0 | 192327.3 | 201837.1 | 2843.9 | 45157.7 | 217464.9 | 1425 |
+
+## Server-side Span Timeline (P95 offset from scenario start, ms)
+
+| Concurrency | Request Start | First Token | Inference End | Request End | Span Duration |
+| --- | --- | --- | --- | --- | --- |
+| **512** | 436797.1 | 575414.9 | 483900.2 | 621756.7 | 217464.9 |
