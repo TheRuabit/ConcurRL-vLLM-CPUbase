@@ -40,7 +40,7 @@ parser.add_argument("--host", default="0.0.0.0",
                     help="Server host")
 parser.add_argument("--tensor-parallel-size", type=int, default=2,
                     help="Number of GPUs for tensor parallelism")
-parser.add_argument("--max-model-len", type=int, default=51200,
+parser.add_argument("--max-model-len", type=int, default=32768,
                     help="Maximum model context length")
 parser.add_argument("--gpu-memory-utilization", type=float, default=0.85,
                     help="GPU memory utilization fraction")
@@ -52,6 +52,14 @@ parser.add_argument("--dtype", default="auto",
                     help="Model dtype (auto, float16, bfloat16)")
 parser.add_argument("--max-num-seqs", type=int, default=1024,
                     help="Maximum number of sequences per iteration")
+parser.add_argument("--max-num-batched-tokens", type=int, default=None,
+                    help="Max tokens per batch (default: 8192 for chunked prefill). "
+                         "Increase to reduce scheduling rounds for long inputs")
+parser.add_argument("--disable-prefix-caching", action="store_true",
+                    help="Pass --no-enable-prefix-caching to vLLM")
+parser.add_argument("--scheduling-policy", default=None,
+                    choices=["fcfs", "priority"],
+                    help="Scheduling policy (default: fcfs)")
 parser.add_argument("--wait-only", action="store_true",
                     help="Only wait for an existing server to become healthy")
 parser.add_argument("--detach", action="store_true",
@@ -63,6 +71,11 @@ parser.add_argument("--health-timeout", type=int, default=200,
                     help="Seconds to wait for server health check")
 parser.add_argument("--log-file", default=None,
                     help="Redirect vLLM output to this file")
+parser.add_argument("--otlp-endpoint", default=None,
+                    help="OpenTelemetry trace endpoint (e.g. http://localhost:4317)")
+parser.add_argument("--collect-detailed-traces", default=None,
+                    choices=["all", "model", "worker"],
+                    help="Collect detailed OTel traces (requires --otlp-endpoint)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -77,6 +90,10 @@ def wait_for_health(url: str, timeout: int) -> bool:
     import urllib.request
     import urllib.error
 
+    # Bypass proxy for localhost health checks
+    proxy_handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(proxy_handler)
+
     print(f"[02_launch] Waiting for server at {url}...")
     start = time.perf_counter()
     attempt = 0
@@ -84,7 +101,7 @@ def wait_for_health(url: str, timeout: int) -> bool:
         attempt += 1
         try:
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with opener.open(req, timeout=5) as resp:
                 if resp.status == 200:
                     elapsed = time.perf_counter() - start
                     print(f"[02_launch] Server ready after {elapsed:.1f}s (attempt {attempt})")
@@ -127,6 +144,19 @@ def main():
     ]
     if chunked:
         cmd.append("--enable-chunked-prefill")
+    if args.max_num_batched_tokens is not None:
+        cmd.extend(["--max-num-batched-tokens", str(args.max_num_batched_tokens)])
+    if args.disable_prefix_caching:
+        cmd.append("--no-enable-prefix-caching")
+    if args.scheduling_policy is not None:
+        cmd.extend(["--scheduling-policy", args.scheduling_policy])
+
+    # OpenTelemetry tracing
+    if args.otlp_endpoint:
+        cmd.extend(["--otlp-traces-endpoint", args.otlp_endpoint])
+        print(f"[02_launch] OTel:   {args.otlp_endpoint}")
+    if args.collect_detailed_traces:
+        cmd.extend(["--collect-detailed-traces", args.collect_detailed_traces])
 
     print(f"[02_launch] Command: {' '.join(cmd)}")
     print(f"[02_launch] Starting vLLM server...\n")
@@ -147,6 +177,7 @@ def main():
             stdout=log_handle if log_handle else sys.stdout,
             stderr=subprocess.STDOUT if log_handle else sys.stderr,
             text=True,
+            start_new_session=args.detach,
         )
 
         # Wait for health in a background thread while process runs

@@ -1,0 +1,3 @@
+# Use pinned local vLLM instrumentation
+
+We will run veRL against a pinned vLLM 0.11 wheel and add minimal local Python-layer, request-correlated instrumentation because aggregate Prometheus and OTel data cannot reliably provide the required admission, scheduling, first-output, KV-allocation-failure, and preemption events. Avoiding a source/CUDA rebuild keeps the smoke test reproducible on the host CUDA stack. We accept the Python patch maintenance cost and will measure instrumentation overhead against an otherwise identical run with event emission disabled. vLLM 0.23 is installed in a separate environment for later adapter or standalone work because the pinned veRL version does not support it directly.

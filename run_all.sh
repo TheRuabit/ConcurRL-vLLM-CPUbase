@@ -12,7 +12,11 @@
 #     03_concurrency_driver.py (async sweep 32 → 1024)
 #     04_metrics_compiler.py   (JSON aggregator + Markdown report)
 #
-#   Phase 2 — Full RL Loop Integration    [TODO]
+#   Phase 2 — Full RL Loop Integration (veRL GRPO)
+#     05_grpo_train.py        (GRPO training via veRL)
+#     06_math_reward.py        (math reward function)
+#     07_phase2_metrics.py     (Phase 2 timing compiler)
+#
 #   Phase 3 — Analysis & Solution Design  [TODO]
 #
 # Usage:
@@ -37,6 +41,17 @@ PHASE="all"
 SERVER_URL="http://localhost:8000"
 MODEL="Qwen/Qwen3-30B-A3B"
 MAX_OUTPUT_TOKEN=64
+INPUT_TOKENS=16000
+SCENARIOS="32 64 128 256 512 1024"
+NUM_BATCHES=3
+MAX_MODEL_LEN=32768
+HEALTH_TIMEOUT=300
+NUM_GPUS=2
+OTLP_ENDPOINT=""
+MAX_NUM_BATCHED_TOKENS=""
+SCHEDULING_POLICY=""
+CONNECTOR_LIMIT=""
+CONNECTOR_LIMIT_PER_HOST=""
 PYTHON="python"
 SKIP_VENV=false
 KEEP_VLLM=false
@@ -51,6 +66,17 @@ while [[ $# -gt 0 ]]; do
         --model)            MODEL="$2";             shift 2 ;;
         --max_output_token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
         --max-output-token) MAX_OUTPUT_TOKEN="$2";  shift 2 ;;
+        --input-tokens)     INPUT_TOKENS="$2";      shift 2 ;;
+        --scenarios)        SCENARIOS="$2";          shift 2 ;;
+        --num-batches)      NUM_BATCHES="$2";        shift 2 ;;
+        --max-model-len)    MAX_MODEL_LEN="$2";      shift 2 ;;
+        --health-timeout)   HEALTH_TIMEOUT="$2";     shift 2 ;;
+        --gpus)             NUM_GPUS="$2";           shift 2 ;;
+        --otlp-endpoint)    OTLP_ENDPOINT="$2";      shift 2 ;;
+        --max-num-batched-tokens) MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
+        --scheduling-policy) SCHEDULING_POLICY="$2"; shift 2 ;;
+        --connector-limit) CONNECTOR_LIMIT="$2"; shift 2 ;;
+        --connector-limit-per-host) CONNECTOR_LIMIT_PER_HOST="$2"; shift 2 ;;
         --python)           PYTHON="$2";            shift 2 ;;
         --skip_venv)        SKIP_VENV=true;         shift  ;;
         --keep-vllm)        KEEP_VLLM=true;         shift  ;;
@@ -58,12 +84,25 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: bash run_all.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --phase <test|1|all>    Which phase to run (default: all)"
+            echo "  --phase <test|1|2|2e|all>  Which phase to run (default: all)"
             echo "                          test  = 01_compile_check.py (mock server)"
             echo "                          1     = 02+03+04 (vLLM concurrency sweep)"
+            echo "                          2     = 05+06+07 (GRPO RL loop via veRL)"
+            echo "                          2e    = 08 multi-turn tool-calling benchmark"
             echo "                          all   = all phases"
             echo "  --model <path>          Model name or path (default: Qwen/Qwen3-30B-A3B)"
             echo "  --max_output_token <N>  Max output tokens per request (default: 64)"
+            echo "  --input-tokens <N>      Input token count (default: 16000)"
+            echo "  --scenarios <list>      Concurrency levels, space-separated (default: '32 64 128 256 512 1024')"
+            echo "  --num-batches <N>       Measurement batches per concurrency level (default: 3)"
+            echo "  --max-model-len <N>     vLLM max model context length (default: 32768)"
+            echo "  --health-timeout <N>    Seconds to wait for vLLM health check (default: 300)"
+            echo "  --gpus <N>              Number of GPUs / tensor parallel size (default: 2)"
+            echo "  --max-num-batched-tokens <N>  Max tokens per scheduler batch (default: 8192 for chunked prefill)"
+            echo "  --scheduling-policy <fcfs|priority>  Scheduling policy (default: fcfs)"
+            echo "  --connector-limit <N>  aiohttp total connection limit for driver (0=unlimited, default=aiohttp default)"
+            echo "  --connector-limit-per-host <N>  aiohttp per-host connection limit for driver (0=unlimited, default=aiohttp default)"
+            echo "  --otlp-endpoint <url>   OpenTelemetry trace endpoint (e.g. http://localhost:4317)"
             echo "  --url <url>             vLLM server URL (default: http://localhost:8000)"
             echo "  --python <cmd>          Python interpreter (default: python)"
             echo "  --keep-vllm             Keep vLLM server running after pipeline completes"
@@ -98,6 +137,17 @@ echo "============================================"
 echo " Phase:             $PHASE"
 echo " Model:             $MODEL"
 echo " Max Output Tokens: $MAX_OUTPUT_TOKEN"
+echo " Input Tokens:      $INPUT_TOKENS"
+echo " Scenarios:         $SCENARIOS"
+echo " Num Batches:       $NUM_BATCHES"
+echo " Max Model Len:     $MAX_MODEL_LEN"
+echo " Health Timeout:    $HEALTH_TIMEOUT"
+echo " Num GPUs (TP):     $NUM_GPUS"
+echo " MaxBatchedTokens:  ${MAX_NUM_BATCHED_TOKENS:-<vllm default>}"
+echo " Scheduling Policy: ${SCHEDULING_POLICY:-<vllm default>}"
+echo " Connector Limit:   ${CONNECTOR_LIMIT:-<aiohttp default>}"
+echo " Connector PerHost: ${CONNECTOR_LIMIT_PER_HOST:-<aiohttp default>}"
+echo " OTLP Endpoint:     ${OTLP_ENDPOINT:-<disabled>}"
 echo " Server URL:        $SERVER_URL"
 echo " Keep vLLM:         $KEEP_VLLM"
 echo "============================================"
@@ -140,9 +190,25 @@ run_phase_1() {
         echo "--- 02 Launch vLLM Server ---"
         echo "[Phase1] Starting vLLM server (this may take a few minutes)..."
         VLLM_PID_FILE="result/vllm_server.pid"
+        local OTLP_ARGS=""
+        if [ -n "$OTLP_ENDPOINT" ]; then
+            OTLP_ARGS="--otlp-endpoint $OTLP_ENDPOINT --collect-detailed-traces all"
+        fi
+        SCHED_ARGS=""
+        if [ -n "$MAX_NUM_BATCHED_TOKENS" ]; then
+            SCHED_ARGS="$SCHED_ARGS --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS"
+        fi
+        if [ -n "$SCHEDULING_POLICY" ]; then
+            SCHED_ARGS="$SCHED_ARGS --scheduling-policy $SCHEDULING_POLICY"
+        fi
         $PYTHON script/02_launch_vllm.py \
             --model "$MODEL" \
             --port "${SERVER_URL##*:}" \
+            --tensor-parallel-size "$NUM_GPUS" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --health-timeout "$HEALTH_TIMEOUT" \
+            $OTLP_ARGS \
+            $SCHED_ARGS \
             --detach \
             --pid-file "$VLLM_PID_FILE"
     fi
@@ -150,13 +216,22 @@ run_phase_1() {
     # Concurrency sweep
     echo ""
     echo "--- 03 Concurrency Driver ---"
+    DRIVER_CONNECTOR_ARGS=""
+    if [ -n "$CONNECTOR_LIMIT" ]; then
+        DRIVER_CONNECTOR_ARGS="$DRIVER_CONNECTOR_ARGS --connector-limit $CONNECTOR_LIMIT"
+    fi
+    if [ -n "$CONNECTOR_LIMIT_PER_HOST" ]; then
+        DRIVER_CONNECTOR_ARGS="$DRIVER_CONNECTOR_ARGS --connector-limit-per-host $CONNECTOR_LIMIT_PER_HOST"
+    fi
     $PYTHON script/03_concurrency_driver.py \
         --url "$SERVER_URL" \
         --model "$MODEL" \
+        --input-tokens "$INPUT_TOKENS" \
         --output-tokens "$MAX_OUTPUT_TOKEN" \
-        --scenarios 32 128 256 512 1024 \
-        --num-batches 3 \
-        --warmup-batches 1
+        --scenarios $SCENARIOS \
+        --num-batches "$NUM_BATCHES" \
+        --warmup-batches 1 \
+        $DRIVER_CONNECTOR_ARGS
     echo "  OK: result/03_concurrency_driver.json"
 
     # Compile metrics
@@ -166,21 +241,122 @@ run_phase_1() {
     echo "  OK: result/04_metrics_compiler.json"
     echo "  OK: PHASE_1_SUMMARY.md"
 
+    # Gauge waveform plots (if poll_samples exist)
+    if $PYTHON -c "import json,sys; d=json.load(open('result/03_concurrency_driver.json')); sys.exit(0 if any(v.get('poll_samples') for v in d.get('vllm_metrics',{}).values()) else 1)" 2>/dev/null; then
+        echo ""
+        echo "--- 03b Gauge Waveform Plots ---"
+        $PYTHON script/03b_gauge_plot.py
+    fi
+
     echo ""
     echo "[Phase 1] Complete. Results in ./result/ and PHASE_1_SUMMARY.md"
 }
 
 # ===================================================================
-# Phase 2: Full RL Loop Integration [TODO]
+# Phase 2: Full RL Loop Integration (veRL GRPO)
 # ===================================================================
 run_phase_2() {
     echo "==========================================="
     echo " PHASE 2: Full RL Loop Integration"
     echo "==========================================="
-    echo "[Phase 2] Not yet implemented."
-    echo "[Phase 2] Will cover: alternation mechanics, phase transition bottlenecks."
+
+    # Download DAPO-Math-17k if not present
+    if [ ! -f "data/dapo-math-17k.parquet" ]; then
+        echo ""
+        echo "--- Download DAPO-Math-17k ---"
+        mkdir -p data
+        echo "[Phase2] Downloading DAPO-Math-17k..."
+        wget -q --show-progress -O data/dapo-math-17k.parquet \
+            "https://hf-mirror.com//datasets/BytedTsinghua-SIA/DAPO-Math-17k/resolve/main/data/dapo-math-17k.parquet?download=true" \
+            || { echo "[Phase2] ERROR: Failed to download DAPO-Math-17k"; exit 1; }
+        echo "[Phase2] OK: data/dapo-math-17k.parquet"
+    else
+        echo "[Phase2] DAPO-Math-17k already present."
+    fi
+
+    # Download AIME-2024 validation set if not present
+    if [ ! -f "data/aime-2024.parquet" ]; then
+        echo "[Phase2] Downloading AIME-2024..."
+        wget -q --show-progress -O data/aime-2024.parquet \
+            "https://hf-mirror.com//datasets/BytedTsinghua-SIA/AIME-2024/resolve/main/data/aime-2024.parquet?download=true" \
+            || echo "[Phase2] WARNING: Failed to download AIME-2024 (validation will be skipped)"
+        echo "[Phase2] OK: data/aime-2024.parquet"
+    fi
+
+    # GRPO training
     echo ""
-    echo "[Phase 2] Skipped."
+    echo "--- 05 GRPO Train (veRL) ---"
+    $PYTHON script/05_grpo_train.py \
+        --model "$MODEL" \
+        --rollout-n 8 \
+        --train-batch-size 32 \
+        --num-epochs 3 \
+        --log-file "result/05_verl_training.log"
+    echo "  OK: result/05_grpo_train.json"
+
+    # Compile Phase 2 metrics
+    echo ""
+    echo "--- 07 Phase 2 Metrics ---"
+    $PYTHON script/07_phase2_metrics.py
+    echo "  OK: result/07_phase2_metrics.json"
+    echo "  OK: PHASE_2_SUMMARY.md"
+
+    echo ""
+    echo "[Phase 2] Complete. Results in ./result/ and PHASE_2_SUMMARY.md"
+}
+
+# ===================================================================
+# Phase 2e: Multi-Turn Tool-Calling Benchmark
+# ===================================================================
+run_phase_2e() {
+    echo "==========================================="
+    echo " PHASE 2e: Multi-Turn Tool-Calling Benchmark"
+    echo "==========================================="
+
+    # Check if server is already running
+    echo "[Phase2e] Checking server at $SERVER_URL ..."
+    if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
+        echo "[Phase2e] Server already running."
+    else
+        echo ""
+        echo "--- Launch vLLM Server ---"
+        echo "[Phase2e] Starting vLLM server..."
+        VLLM_PID_FILE="result/vllm_server.pid"
+        $PYTHON script/02_launch_vllm.py \
+            --model "$MODEL" \
+            --port "${SERVER_URL##*:}" \
+            --tensor-parallel-size "$NUM_GPUS" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --health-timeout "$HEALTH_TIMEOUT" \
+            --detach \
+            --pid-file "$VLLM_PID_FILE"
+    fi
+
+    # Multi-turn tool-calling sweep
+    echo ""
+    echo "--- 08 Tool-Calling Sweep ---"
+    $PYTHON script/08b_tool_call_sweep.py \
+        --url "$SERVER_URL" \
+        --model "$MODEL" \
+        --num-batches "$NUM_BATCHES" \
+        --warmup-batches 1
+    echo "  OK: result/08_sweep/"
+
+    # Compile metrics
+    echo ""
+    echo "--- 08c Metrics Compiler ---"
+    $PYTHON script/08c_tool_call_metrics.py
+    echo "  OK: result/08c_tool_call_metrics.json"
+    echo "  OK: PHASE_2E_SUMMARY.md"
+
+    # Generate plots
+    echo ""
+    echo "--- 08d Plot Generator ---"
+    $PYTHON script/08d_tool_call_plot.py
+    echo "  OK: result/plots/08e_*.png"
+
+    echo ""
+    echo "[Phase 2e] Complete. Results in ./result/ and PHASE_2E_SUMMARY.md"
 }
 
 # ===================================================================
@@ -209,6 +385,9 @@ case "$PHASE" in
     2)
         run_phase_2
         ;;
+    2e)
+        run_phase_2e
+        ;;
     3)
         run_phase_3
         ;;
@@ -221,12 +400,15 @@ case "$PHASE" in
         read -p "Press Enter to continue to Phase 2..."
         run_phase_2
         echo ""
+        read -p "Press Enter to continue to Phase 2e (multi-turn tool-calling)..."
+        run_phase_2e
+        echo ""
         read -p "Press Enter to continue to Phase 3..."
         run_phase_3
         ;;
     *)
         echo "Unknown phase: $PHASE"
-        echo "Valid options: test, 1, 2, 3, all"
+        echo "Valid options: test, 1, 2, 2e, 3, all"
         exit 1
         ;;
 esac
@@ -253,5 +435,5 @@ echo ""
 echo "============================================"
 echo " Benchmark pipeline complete!"
 echo " Results: ./result/"
-echo " Report:  ./PHASE_1_SUMMARY.md"
+echo " Reports: ./PHASE_1_SUMMARY.md, ./PHASE_2_SUMMARY.md"
 echo "============================================"

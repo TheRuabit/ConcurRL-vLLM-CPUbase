@@ -1,12 +1,24 @@
 models/
 reference/
 venv/
+.venv/
+.venv-*/
+.deps/
+.tools/
+data/
 __pycache__/
 *.log
 .env
 result/
 .claude/
+.mimocode/
+.tex/
+tex/
+
 
 # Unrelevant file
 PLAN.md
 Phase1PLAN.md
+Phase2PLAN.md
+CLAUDE.md
+CONTEXT.md
